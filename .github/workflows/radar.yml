@@ -1,0 +1,45 @@
+name: Actualizar radar
+
+on:
+  schedule:
+    - cron: "5 14-20 * * 1-5"
+    - cron: "30 21 * * 1-5"
+    - cron: "0 15 * * 6"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: true
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Recuperar caché de earnings
+        uses: actions/cache@v4
+        with:
+          path: earnings_cache.json
+          key: earnings-${{ github.run_id }}
+          restore-keys: earnings-
+      - name: Correr el radar
+        run: python radar.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
