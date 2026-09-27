@@ -1,6 +1,8 @@
 # ⚙️ CONFIGURACIÓN — cambiá los valores y guardá (commit). La próxima corrida los usa.
 # **Requisitos**
 PRECIO_MINIMO = 10
+ADR_MINIMO = 2.0
+ADR_PERIODO = 20
 MIN_CRITERIOS_MINERVINI = 6
 PCT_SOBRE_MINIMO_52S = 30
 PCT_DEBAJO_MAXIMO_52S = 30
@@ -16,7 +18,9 @@ BUSCAR_EARNINGS = True
 VOL_RUPTURA = 1.3
 CERCA_GATILLO = 2.0
 ANALIZAR_30M = True
-EMAS_INTRADIA = "10, 20, 50"
+EMAS_DIARIO_PIVOT = "8, 10, 20, 50"
+TOLERANCIA_TOQUE_EMA = 0.5
+DIAS_TOQUE_EMA = 2
 # **Episodic pivots y banderas**
 EP_MIN_SUBA = 4.0
 EP_MIN_VOL = 2.0
@@ -199,6 +203,11 @@ def rs_bruto(c):
     def r(n): return c.iloc[-1] / c.iloc[-n - 1] - 1 if len(c) > n else c.iloc[-1] / c.iloc[0] - 1
     return 0.4 * r(63) + 0.2 * r(126) + 0.2 * r(189) + 0.2 * r(252)
 
+def adr_pct(df, n=None):
+    n = n or ADR_PERIODO
+    r = (df.High / df.Low).iloc[-n:]
+    return (r.mean() - 1) * 100 if len(r) else 0.0
+
 def minervini(df, rs):
     c = df.Close; p = c.iloc[-1]
     s50, s150, s200 = sma(c, 50), sma(c, 150), sma(c, 200)
@@ -283,15 +292,17 @@ def regimen(indices, vix, acciones):
     if mx: capas.append({"nombre": "Índices SPY y QQQ", "pts": num(pts, 1), "max": mx, "det": det})
     acc = [d for d in acciones if len(d) >= 220]
     if len(acc) >= 50:
-        p200 = np.mean([d.Close.iloc[-1] > ema(d.Close, 200).iloc[-1] for d in acc])
-        p50 = np.mean([d.Close.iloc[-1] > d.Close.iloc[-50:].mean() for d in acc])
+        pe200 = np.mean([d.Close.iloc[-1] > ema(d.Close, 200).iloc[-1] for d in acc])
+        ps200 = np.mean([d.Close.iloc[-1] > d.Close.iloc[-200:].mean() for d in acc])
+        p50 = np.mean([d.Close.iloc[-1] > ema(d.Close, 50).iloc[-1] for d in acc])
+        p200 = (pe200 + ps200) / 2
         nh = sum(d.High.iloc[-1] >= d.High.iloc[-253:-1].max() for d in acc)
         nl = sum(d.Low.iloc[-1] <= d.Low.iloc[-253:-1].min() for d in acc)
         s1 = float(np.clip((p200 - 0.3) / 0.4, 0, 1) * 10)
         s2 = float(np.clip((p50 - 0.3) / 0.4, 0, 1) * 10)
         s3 = nh / (nh + nl) * 10 if nh + nl else 5.0
         capas.append({"nombre": "Amplitud del universo", "pts": num(s1 + s2 + s3, 1), "max": 30,
-                      "det": [f"{p200:.0%} de las acciones sobre la EMA200", f"{p50:.0%} sobre la SMA50",
+                      "det": [f"{pe200:.0%} de las acciones sobre la EMA200 y {ps200:.0%} sobre la SMA200", f"{p50:.0%} sobre la EMA50",
                               f"{nh} nuevos máximos de 52 semanas contra {nl} nuevos mínimos"]})
     if vix is not None and len(vix):
         v = float(vix.Close.iloc[-1])
@@ -411,38 +422,56 @@ def inside(df):
     return {"n": n, "madre_hi": num(h[i], 4), "madre_lo": num(l[i], 4),
             "dist_hi": num((h[i] / df.Close.iloc[-1] - 1) * 100)}
 
-# ---------------------------------------------------------------- pivot 30 min
+# ---------------------------------------------------------------- pivot 30 min sobre EMA diaria
 def lista_emas():
-    return [int(x) for x in str(EMAS_INTRADIA).replace(";", ",").replace("/", ",").split(",") if x.strip().isdigit()]
+    return [int(x) for x in str(EMAS_DIARIO_PIVOT).replace(";", ",").replace("/", ",").split(",") if x.strip().isdigit()]
 
-def pivot_30m(df):
+def toque_ema_diaria(dd):
+    """Busca en las últimas DIAS_TOQUE_EMA velas diarias un toque o undercut a alguna EMA diaria.
+    Devuelve (fecha, ema, valor de la EMA, cuántas ruedas atrás) o None."""
     emas = lista_emas()
-    if df is None or not emas or len(df) < max(emas) + 10: return None
-    h, l, c = df.High.values, df.Low.values, df.Close.values
-    n = len(df)
-    piv = None
-    for i in range(n - 3, max(n - 40, 2) - 1, -1):
-        if h[i] > h[i - 2:i].max() and h[i] >= h[i + 1:i + 3].max():
-            piv = i; break
-    if piv is None: return None
-    mejor = None  # (ema, índice del retest, serie)
-    for ne in emas:
-        e = ema(df.Close, ne).values
-        toques = [j for j in range(piv + 1, n) if l[j] <= e[j] * 1.003 and c[j] >= e[j] * 0.997]
-        if toques and (mejor is None or toques[-1] > mejor[1]):
-            mejor = (ne, toques[-1], e)
-    if mejor is None: return None
-    ne, j, e = mejor
-    nivel = h[piv]
-    arriba = [k for k in range(j, n) if c[k] > nivel]
-    if arriba:
-        if arriba[0] < n - 3: return None
+    if dd is None or not emas or len(dd) < max(emas) + 5: return None
+    tol = TOLERANCIA_TOQUE_EMA / 100
+    series = {n: ema(dd.Close, n) for n in emas}
+    for k in range(1, DIAS_TOQUE_EMA + 1):
+        i = len(dd) - k
+        lo, hi = dd.Low.iloc[i], dd.High.iloc[i]
+        tocadas = [(n, series[n].iloc[i]) for n in emas
+                   if lo <= series[n].iloc[i] * (1 + tol) and hi >= series[n].iloc[i]]
+        if tocadas:
+            n, v = min(tocadas, key=lambda x: abs(lo - x[1]))
+            return dd.index[i], n, v, k - 1
+    return None
+
+def pivot_30m(m30, dd):
+    """30 Min Pivot: tras el toque/undercut de una EMA diaria, la primera vela verde de 30 min
+    después del mínimo marca la entrada (su máximo) y el stop (su mínimo)."""
+    t = toque_ema_diaria(dd)
+    if t is None or m30 is None or len(m30) < 5: return None
+    dia, ne, ve, hace = t
+    idx = m30.index.tz_localize(None) if getattr(m30.index, "tz", None) is not None else m30.index
+    ini = int(np.searchsorted(idx.normalize(), pd.Timestamp(dia).normalize()))
+    if ini >= len(m30): return None
+    tol = TOLERANCIA_TOQUE_EMA / 100
+    o, h, l, c = m30.Open.values, m30.High.values, m30.Low.values, m30.Close.values
+    n = len(m30)
+    toque = next((j for j in range(ini, n) if l[j] <= ve * (1 + tol)), None)
+    if toque is None: return None
+    piso = toque + int(np.argmin(l[toque:]))
+    base = {"ema_n": ne, "ema": num(ve, 4), "toque": "hoy" if hace == 0 else ("ayer" if hace == 1 else f"hace {hace} ruedas"),
+            "minimo": num(l[piso], 4)}
+    verde = next((j for j in range(piso, n) if c[j] > o[j]), None)
+    if verde is None:
+        return {**base, "estado": "esperando", "entrada": None, "stop": None, "riesgo": None, "dist": None}
+    entrada, stop = h[verde], l[verde]
+    cruce = next((k for k in range(verde + 1, n) if h[k] > entrada), None)
+    if cruce is not None:
+        if cruce < n - 6: return None  # se disparó hace más de 3 horas
         est = "disparado"
     else:
-        if c[-1] < e[-1] or (nivel / c[-1] - 1) > 0.015: return None
         est = "armado"
-    return {"estado": est, "pivote": num(nivel, 4), "ema_n": ne, "ema": num(e[-1], 4), "stop": num(l[j:].min(), 4),
-            "dist": num((nivel / c[-1] - 1) * 100)}
+    return {**base, "estado": est, "entrada": num(entrada, 4), "stop": num(stop, 4),
+            "riesgo": num((entrada - stop) / entrada * 100), "dist": num((c[-1] / entrada - 1) * 100)}
 
 # ---------------------------------------------------------------- score
 def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv):
@@ -454,7 +483,7 @@ def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv):
         setup += 12 if sav_d["estado"] == "rompe" else 7
     if comp_d_rup: setup += 6
     if ins_d and ins_d.get("n", 0) >= 1: setup += 3 if ins_d["n"] == 1 else 5
-    if piv: setup += 4
+    if piv and piv.get("estado") != "esperando": setup += 4
     return {"tend": num(tend, 1), "rs": num(fuer, 1), "contr": num(contr, 1), "setup": num(min(setup, 20), 1)}
 
 def spark(s, n): return [num(x, 4) for x in s.iloc[-n:].values]
@@ -479,25 +508,28 @@ def correr():
     reg = regimen({t: diario.get(t, extra.get(t)) for t in ("SPY", "QQQ")}, extra.get("^VIX"),
                   [d for t, d in diario.items() if info.at[t, "tipo"] == "accion"])
     r21_pct = pd.Series(ret21).rank(pct=True) * 100
-    print("3/5 Aplicando Minervini y precio mínimo…")
+    print("3/5 Aplicando Minervini, precio mínimo y ADR…")
     cand = {}
     for t, df in diario.items():
         if t not in rs_pct.index: continue
         tipo = info.at[t, "tipo"]
         if tipo != "cripto" and df.Close.iloc[-1] < PRECIO_MINIMO: continue
+        if adr_pct(df) < ADR_MINIMO: continue
         checks, hi, lo = minervini(df, rs_pct[t])
         if sum(checks) >= MIN_CRITERIOS_MINERVINI:
             cand[t] = (checks, hi, lo)
-    print(f"   {len(cand)} pasan Minervini ({MIN_CRITERIOS_MINERVINI}/8) y precio")
+    print(f"   {len(cand)} pasan Minervini ({MIN_CRITERIOS_MINERVINI}/8), precio y ADR")
     print("4/5 Historia completa, earnings y AVWAP de los candidatos…")
     hist = descargar(list(cand), "max", "1d") if cand else {}
     activos = []
+    dfs_d = {}
     hoy = pd.Timestamp.now()
     for t, (checks, hi, lo) in cand.items():
         tipo = info.at[t, "tipo"]
         df = hist.get(t)
         if df is None or len(df) < len(diario[t]): df = diario[t]
         wk = semanal(df, tipo == "cripto")
+        dfs_d[t] = df
         earn, prox = (fechas_earnings(t) if (BUSCAR_EARNINGS and tipo == "accion") else (None, None))
         es_ipo = tipo == "accion" and df.index[0] > hoy - pd.Timedelta(days=3 * 365)
         ep = episodic(df)
@@ -519,7 +551,7 @@ def correr():
             "hi52": num(hi, 4), "lo52": num(lo, 4), "pos52": num((c.iloc[-1] - lo) / (hi - lo) * 100 if hi > lo else 100, 0),
             "avwap": av, "comp": comp, "inside": ins, "setup_av": sav, "pivot30": None,
             "earn_prox": prox.strftime("%d-%m-%Y") if prox is not None else None,
-            "earn_dias": earn_dias, "earn_momento": momento_earnings(prox),
+            "adr": num(adr_pct(df), 2), "earn_dias": earn_dias, "earn_momento": momento_earnings(prox),
             "ep": {k: v for k, v in ep.items() if not k.startswith("_")} if ep else None,
             "estadio": estadio(df), "flags": banderas(df, sav["d"], earn_dias),
             "spark_d": spark(c, 63), "spark_w": spark(wk.Close, 30), "_r21p": float(r21_pct.get(t, 50)),
@@ -528,9 +560,9 @@ def correr():
     con30 = bool(ANALIZAR_30M and activos)
     if con30:
         print("5/5 Buscando pivots de 30 minutos…")
-        m30 = descargar([a["t"] for a in activos], "1mo", "30m")
+        m30 = descargar([a["t"] for a in activos], "5d", "30m")
         for a in activos:
-            a["pivot30"] = pivot_30m(m30.get(a["t"]))
+            a["pivot30"] = pivot_30m(m30.get(a["t"]), dfs_d.get(a["t"]))
     else:
         print("5/5 Intradía desactivado")
     for a in activos:
@@ -547,7 +579,7 @@ def correr():
                    "rs_min": RS_MINIMO, "precio_min": PRECIO_MINIMO, "exigir_av": EXIGIR_AVWAP,
                    "dist_d": DIST_POR_ROMPER_DIARIO, "dist_w": DIST_POR_ROMPER_SEMANAL,
                    "velas_d": VELAS_RUPTURA_DIARIO, "velas_w": VELAS_RUPTURA_SEMANAL, "emas_30m": lista_emas(),
-                   "vol_ruptura": VOL_RUPTURA, "cerca_gatillo": CERCA_GATILLO,
+                   "vol_ruptura": VOL_RUPTURA, "adr_min": ADR_MINIMO, "cerca_gatillo": CERCA_GATILLO,
                    "ep_suba": EP_MIN_SUBA, "ep_vol": EP_MIN_VOL}},
         "activos": sorted(activos, key=lambda a: -a["score"])}
     html = PLANTILLA.replace("__DATA__", json.dumps(datos, ensure_ascii=False, allow_nan=False, default=str))
@@ -806,7 +838,7 @@ const pct = (v,d=2) => (v==null||isNaN(v)) ? '–' : (v>0?'+':'')+fmt(v,d)+'%';
 const cls = v => v>0 ? 'up' : v<0 ? 'down' : 'mut';
 const TFN = {d:'diario', w:'semanal'};
 const EST = {'rompe':['rompe','Rompiendo'],'por romper':['porromper','Por romper'],'arriba':['otro','Arriba'],'abajo':['otro','Abajo'],
-  'disparado':['disparado','Disparado'],'armado':['armado','Armado'],'rompio':['rompio','Rompió'],'preparada':['preparada','Preparada']};
+  'disparado':['disparado','Disparado'],'armado':['armado','Armado'],'esperando':['otro','Esperando'],'rompio':['rompio','Rompió'],'preparada':['preparada','Preparada']};
 const badge = e => { const x = EST[e] || ['otro', e]; return `<span class="est ${x[0]}">${x[1]}</span>`; };
 const ESTADIOS = {1:'Estadio 1 · base',2:'Estadio 2 · tendencia alcista',3:'Estadio 3 · techo',4:'Estadio 4 · tendencia bajista'};
 
@@ -828,7 +860,7 @@ const PAGS = [
   ['comp','Compresión','Activos apretados en precio (ATR y ancho de Bollinger) y en volumen.'],
   ['inside','Inside','Velas con máximo y mínimo dentro de la vela anterior. El gatillo alcista es el máximo de la vela madre.'],
   ['ep','Episodic','Días con suba fuerte y volumen explosivo: posible entrada institucional y nuevo ancla de AVWAP.'],
-  ['setups','Setups','Tus setups: ruptura de AVWAP, ruptura de compresión y pivot de 30 minutos.'],
+  ['setups','Setups','Tus setups: ruptura de AVWAP, ruptura de compresión y 30 Min Pivot sobre EMA diaria.'],
 ];
 
 function spark(arr, w=84, h=24){
@@ -883,7 +915,7 @@ function vInicio(){
     ['comp', act.filter(a=>a.comp[tf]&&a.comp[tf].es).length, `comprimidos (${TFN[tf]})`, 'comp'],
     ['inside', act.filter(a=>a.inside[tf]&&a.inside[tf].n>=1).length, `con inside ${tf==='d'?'day':'week'}`, 'inside'],
     ['ep', act.filter(a=>a.ep).length, 'episodic pivots (10 ruedas)', 'ep'],
-    ['setups', act.filter(a=>a.setup_av[tf]||a.pivot30).length, 'con algún setup activo', 'setups'],
+    ['setups', act.filter(a=>a.setup_av[tf]||(a.pivot30&&a.pivot30.estado!=='esperando')).length, 'con algún setup activo', 'setups'],
   ];
   const kpis = `<div class="kpis">${k.map(([ic,v,l,p])=>`<button class="card kpi" data-ir="${p}"><span class="ic">${ico(ic)}</span><b>${v}</b><span>${l}</span></button>`).join('')}</div>`;
   const reg = R ? `<div class="card"><h3>Régimen de mercado <small>contexto para dimensionar</small></h3>
@@ -924,6 +956,7 @@ function vSectores(){
     {h:'Calor', n:1, f:r=>fmt(r.a.calor,0)},
     {h:'Score', n:1, f:r=>fmt(r.a.score,0)},
     {h:'RS', n:1, f:r=>fmt(r.a.rs,0)},
+    {h:'ADR', n:1, f:r=>fmt(r.a.adr,1)+'%'},
     {h:'AVWAP', f:r=>{const m=mejorAv(r.a,tf); return m ? `${badge(m.estado)} <span class="mut">${esc(m.ancla)}</span>` : '<span class="mut">–</span>';}},
     {h:'1 mes', n:1, f:r=>`<span class="${cls(r.a.ret21)}">${pct(r.a.ret21,1)}</span>`},
   ];
@@ -1042,16 +1075,17 @@ function vSetups(){
     {h:'Vol. relativo', n:1, f:r=>fmt(r.a.comp[tf].vol_hoy,1)+'x'},
     {h:'Compresión', f:r=>barra(r.a.comp[tf].score)},
   ];
+  const ORD = {disparado:0, armado:1, esperando:2};
   const pv = act.filter(a=>a.pivot30 && (!S.emaF || a.pivot30.ema_n===S.emaF)).map(a=>({a, p:a.pivot30}))
-    .sort((p,q)=> (p.p.estado===q.p.estado ? Math.abs(p.p.dist)-Math.abs(q.p.dist) : (p.p.estado==='disparado'?-1:1)));
+    .sort((p,q)=> (ORD[p.p.estado]-ORD[q.p.estado]) || ((p.p.riesgo??99)-(q.p.riesgo??99)));
   const cPv = [
     {h:'Ticker', f:r=>tk(r.a)},
     {h:'Estado', f:r=>badge(r.p.estado)},
-    {h:'Pivote', n:1, f:r=>pr(r.p.pivote)},
-    {h:'EMA del retest', f:r=>`<span class="tk">EMA${r.p.ema_n}</span>`},
-    {h:'Valor EMA', n:1, f:r=>pr(r.p.ema)},
-    {h:'Stop (retest)', n:1, f:r=>pr(r.p.stop)},
-    {h:'Al pivote', n:1, f:r=>pct(r.p.dist)},
+    {h:'EMA diaria', f:r=>`<span class="tk">EMA${r.p.ema_n}</span> <span class="mut">${esc(r.p.toque)} · ${pr(r.p.ema)}</span>`},
+    {h:'Entrada (máx. vela verde)', n:1, f:r=>pr(r.p.entrada)},
+    {h:'Stop (mín. vela verde)', n:1, f:r=>pr(r.p.stop)},
+    {h:'Riesgo', n:1, f:r=>r.p.riesgo!=null ? fmt(r.p.riesgo,1)+'%' : '–'},
+    {h:'Precio vs. entrada', n:1, f:r=>r.p.dist!=null ? `<span class="${cls(r.p.dist)}">${pct(r.p.dist)}</span>` : '–'},
     {h:'AVWAP diario', f:r=>{const m=mejorAv(r.a,'d'); return m ? badge(m.estado) : '<span class="mut">–</span>';}},
   ];
   return `<h2 class="sec" style="margin-top:0">Ruptura de AVWAP <small>${TFN[tf]}</small></h2>
@@ -1060,10 +1094,10 @@ function vSetups(){
   <h2 class="sec">Ruptura de compresión <small>${TFN[tf]}</small></h2>
   <p class="nota">"Rompió" = venía comprimida, cerró sobre el gatillo y con volumen de al menos ${fmt(P.vol_ruptura,1)}x el promedio. "Preparada" = comprimida y a ${P.cerca_gatillo}% o menos del gatillo.</p>
   ${card('Compresiones', cb.length, tabla(cCb, cb, 'Ninguna ruptura de compresión en '+TFN[tf]+'.'))}
-  <h2 class="sec">Pivot de 30 minutos <small>intradía</small></h2>
+  <h2 class="sec">30 Min Pivot <small>undercut de EMA diaria + primera vela verde</small></h2>
   <div class="filtros">${[0].concat(P.emas_30m).map(e=>`<button class="chip" data-ema="${e}" aria-pressed="${S.emaF===e}">${e?'EMA'+e:'Todas las EMA'}</button>`).join('')}</div>
-  <p class="nota">Pivot alto de 30 min con un retest posterior que aguantó a alguna de las EMA ${P.emas_30m.join(', ')}. "Armado" = a 1,5% o menos del pivote; "disparado" = lo superó en las últimas 3 velas.${D.meta.con30m ? '' : ' El análisis intradía estaba desactivado en esta corrida.'}</p>
-  ${card('Pivots de 30 min', pv.length, tabla(cPv, pv, 'Ningún pivot de 30 min armado ahora.'))}`;
+  <p class="nota">En diario, el precio tocó o perforó (undercut) alguna de las EMA ${P.emas_30m.join(', ')}, hoy o ayer. En 30 min, la primera vela verde después del mínimo marca la entrada (su máximo) y el stop (su mínimo). "Esperando" = tocó la EMA pero todavía no hay vela verde; "armado" = hay vela verde y no superó su máximo; "disparado" = superó el máximo en las últimas 3 horas.${D.meta.con30m ? '' : ' El análisis intradía estaba desactivado en esta corrida.'}</p>
+  ${card('30 Min Pivot', pv.length, tabla(cPv, pv, 'Ninguna acción tocó sus EMAs diarias hoy o ayer.'))}`;
 }
 
 /* ---------- Ficha ---------- */
@@ -1098,6 +1132,7 @@ function ficha(t){
       ${cmp('d')}${cmp('w')}${ins('d')}${ins('w')}
       ${a.ep ? `<span>Episodic pivot</span><span>${a.ep.dias===0?'hoy':'hace '+a.ep.dias+' ruedas'} · ${pct(a.ep.suba,1)} · ${fmt(a.ep.vol_x,1)}x</span>` : ''}
       <span>RS</span><span>${fmt(a.rs,0)}</span>
+      <span>ADR% (20 días)</span><span>${fmt(a.adr,2)}%</span>
       <span>Retorno 1 mes</span><span class="${cls(a.ret21)}">${pct(a.ret21,1)}</span>
       ${a.earn_prox ? `<span>Próximos earnings</span><span>${esc(a.earn_prox)}${a.earn_momento?' · '+esc(a.earn_momento):''}</span>` : ''}
     </div>
@@ -1146,7 +1181,7 @@ document.addEventListener('keydown', e => { if(e.key==='Escape') cerrarFicha(); 
 
 const m = D.meta;
 $('#meta').innerHTML = `Actualizado ${esc(m.generado)}${m.demo ? '<span class="demo">· datos simulados</span>' : ''}`;
-$('#pie').innerHTML = `${m.n_universo} activos analizados. Requisitos: al menos ${P.min_mv} de 8 criterios de Minervini (${P.sobre_min}% sobre el mínimo y dentro del ${P.bajo_max}% del máximo de 52 semanas, RS ${P.rs_min}+), precio de ${P.precio_min} USD o más en acciones y ETF${P.exigir_av ? ', y rompiendo o por romper al menos una AVWAP' : ''}. Horarios en hora de Argentina. Esto es un filtro técnico, no una recomendación de compra.`;
+$('#pie').innerHTML = `${m.n_universo} activos analizados. Requisitos: al menos ${P.min_mv} de 8 criterios de Minervini (${P.sobre_min}% sobre el mínimo y dentro del ${P.bajo_max}% del máximo de 52 semanas, RS ${P.rs_min}+), precio de ${P.precio_min} USD o más en acciones y ETF, ADR de ${fmt(P.adr_min,1)}% o más${P.exigir_av ? ', y rompiendo o por romper al menos una AVWAP' : ''}. Horarios en hora de Argentina. Esto es un filtro técnico, no una recomendación de compra.`;
 render();
 </script>
 </body>
