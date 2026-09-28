@@ -21,6 +21,17 @@ ANALIZAR_30M = True
 EMAS_DIARIO_PIVOT = "8, 10, 20, 50"
 TOLERANCIA_TOQUE_EMA = 0.5
 DIAS_TOQUE_EMA = 2
+# **Bases VCP**
+VCP_MIN_CONTRACCIONES = 2
+VCP_ULTIMA_MAX = 10.0
+VCP_PRIMERA_MAX = 50.0
+VCP_VOL_SECO = 1.0
+VCP_DIST_PIVOT = 5.0
+VCP_SEMANAS_MIN = 3
+VCP_SEMANAS_MAX = 65
+VCP_TENDENCIA_PREVIA = 30
+VCP_DIAS_RUPTURA = 3
+VCP_DIAS_SEGUIMIENTO = 15
 # **Episodic pivots y banderas**
 EP_MIN_SUBA = 4.0
 EP_MIN_VOL = 2.0
@@ -473,8 +484,132 @@ def pivot_30m(m30, dd):
     return {**base, "estado": est, "entrada": num(entrada, 4), "stop": num(stop, 4),
             "riesgo": num((entrada - stop) / entrada * 100), "dist": num((c[-1] / entrada - 1) * 100)}
 
+# ---------------------------------------------------------------- bases VCP
+def _zigzag(hi, lo, u):
+    """Vaivenes de precio: alterna máximos (H) y mínimos (L) que se dan vuelta al menos `u` (fracción).
+    Devuelve [(índice, precio, tipo)]; el último punto es el extremo en curso."""
+    n = len(hi); piv = []
+    if n < 3: return piv
+    ih = il = 0; dirc = 0
+    for i in range(1, n):
+        if dirc == 0:
+            if hi[i] > hi[ih]: ih = i
+            if lo[i] < lo[il]: il = i
+            if il < ih and hi[ih] >= lo[il] * (1 + u): piv.append((il, lo[il], "L")); dirc = 1
+            elif ih < il and lo[il] <= hi[ih] * (1 - u): piv.append((ih, hi[ih], "H")); dirc = -1
+        elif dirc == 1:
+            if hi[i] >= hi[ih]: ih = i
+            elif lo[i] <= hi[ih] * (1 - u): piv.append((ih, hi[ih], "H")); dirc = -1; il = i
+        else:
+            if lo[i] <= lo[il]: il = i
+            elif hi[i] >= lo[il] * (1 + u): piv.append((il, lo[il], "L")); dirc = 1; ih = i
+    if dirc == 1: piv.append((ih, hi[ih], "H"))
+    elif dirc == -1: piv.append((il, lo[il], "L"))
+    return piv
+
+def _vcp_desde(j, piv, hi, lo):
+    """Arma las contracciones a partir del máximo de la base piv[j]. Devuelve (contracciones, índice de ruptura o None)."""
+    H0 = piv[j][1]
+    contr, cur = [], (piv[j][0], H0)
+    k = j + 1
+    while k < len(piv):
+        i, p, tp = piv[k]
+        if tp == "L":
+            if contr and p < contr[-1]["lo"]:   # perfora el mínimo anterior: es la misma contracción
+                contr[-1].update(lo_i=i, lo=p)
+            else:
+                contr.append({"hi_i": cur[0], "hi": cur[1], "lo_i": i, "lo": p})
+        else:
+            if p > H0 * 1.005: break            # superó el máximo de la base
+            if contr and p > contr[-1]["hi"] and _vcp_valida(contr):
+                break                            # rompió el pivot con la base ya armada
+            cur = (i, p)
+        k += 1
+    return contr
+
+def _depth(c): return (c["hi"] - c["lo"]) / c["hi"] * 100
+
+def _vcp_valida(contr):
+    if len(contr) < VCP_MIN_CONTRACCIONES: return False
+    d = [_depth(c) for c in contr]
+    return d[0] <= VCP_PRIMERA_MAX and all(d[x + 1] < d[x] for x in range(len(d) - 1))
+
+def detectar_vcp(df):
+    """Detecta una base VCP en velas diarias y su estado."""
+    n = len(df)
+    if n < 160: return None
+    ventana = min(n - 1, VCP_SEMANAS_MAX * 5 + 30)
+    d = df.iloc[-ventana:]
+    hi, lo, cl, vo = d.High.values, d.Low.values, d.Close.values, d.Volume.values
+    m = len(d)
+    adr = adr_pct(df)
+    piv = _zigzag(hi, lo, max(0.03, 0.8 * adr / 100))
+    if len(piv) < 4: return None
+    mejor = None
+    for j, (i0, p0, tp) in enumerate(piv):
+        if tp != "H" or m - 1 - i0 > VCP_SEMANAS_MAX * 5 or m - 1 - i0 < VCP_SEMANAS_MIN * 5: continue
+        # tendencia previa: el máximo de la base tiene que estar lejos del mínimo de los 6 meses anteriores
+        g = n - m + i0
+        previo = df.Low.iloc[max(0, g - 126):g]
+        if len(previo) < 40 or p0 / previo.min() - 1 < VCP_TENDENCIA_PREVIA / 100: continue
+        contr = _vcp_desde(j, piv, hi, lo)
+        if not contr: continue
+        # contracción chica en curso desde el último máximo (bandera final apretada)
+        ult = contr[-1]
+        hs = [q for q in piv if q[2] == "H" and q[0] > ult["lo_i"]]
+        if hs and hs[-1][0] == piv[-1][0] and all(q[1] < ult["hi"] for q in hs):
+            h_i, h_p = hs[-1][0], hs[-1][1]
+            if h_i < m - 1:
+                l_i = h_i + 1 + int(np.argmin(lo[h_i + 1:]))
+                if (h_p - lo[l_i]) / h_p * 100 >= 2:
+                    contr = contr + [{"hi_i": h_i, "hi": h_p, "lo_i": l_i, "lo": lo[l_i]}]
+        if not _vcp_valida(contr): continue
+        if mejor is None or len(contr) > len(mejor[1]) or (len(contr) == len(mejor[1]) and i0 < mejor[0]):
+            mejor = (i0, contr)
+    if mejor is None: return None
+    i0, contr = mejor
+    ult = contr[-1]
+    pivot, stop = ult["hi"], ult["lo"]
+    vol50 = pd.Series(vo).rolling(50).mean().values
+    # ruptura: primer cierre sobre el pivot después del mínimo de la última contracción
+    b = next((x for x in range(ult["lo_i"] + 1, m) if cl[x] > pivot), None)
+    # secado de volumen: promedio desde el inicio de la última contracción vs. promedio de 50 ruedas previo
+    fin_c = (b - 1) if b is not None else m - 1
+    ref = vol50[ult["hi_i"]] if not np.isnan(vol50[ult["hi_i"]]) else np.nanmean(vo[:ult["hi_i"] + 1])
+    seco = float(np.mean(vo[ult["hi_i"]:fin_c + 1]) / ref) if ref and fin_c >= ult["hi_i"] else None
+    dias = vol_b = None
+    if b is not None:
+        dias = m - 1 - b
+        vol_b = float(vo[b] / vol50[b - 1]) if b > 0 and vol50[b - 1] else None
+        if dias > VCP_DIAS_SEGUIMIENTO: return None
+        if any(cl[x] < pivot for x in range(b + 1, m)): est = "fallo"
+        elif dias < VCP_DIAS_RUPTURA: est = "recien"
+        else: est = "confirmo"
+    else:
+        dist = (pivot / cl[-1] - 1) * 100
+        if cl[-1] < stop: return None
+        est = "armada" if (_depth(ult) <= VCP_ULTIMA_MAX and seco is not None and seco < VCP_VOL_SECO
+                           and dist <= VCP_DIST_PIVOT) else "formandose"
+    fin = b if b is not None else m - 1
+    semanas = (fin - i0) / 5
+    if semanas < VCP_SEMANAS_MIN: return None
+    # serie para el gráfico de la ficha (desde un poco antes de la base)
+    s0 = max(0, i0 - 10)
+    serie = cl[s0:]
+    paso = max(1, len(serie) // 140)
+    fecha = lambda x: d.index[x].strftime("%d-%m-%y")
+    return {
+        "estado": est, "contr": [num(_depth(c), 1) for c in contr], "semanas": num(semanas, 0),
+        "pivot": num(pivot, 4), "stop": num(stop, 4), "riesgo": num((pivot - stop) / pivot * 100, 1),
+        "dist": num((cl[-1] / pivot - 1) * 100), "seco": num(seco, 2) if seco is not None else None,
+        "vol_rup": num(vol_b, 1) if vol_b is not None else None, "dias_rup": dias,
+        "inicio": fecha(i0), "maximo": num(contr[0]["hi"], 4),
+        "serie": [num(x, 4) for x in serie[::paso]] + ([num(serie[-1], 4)] if (len(serie) - 1) % paso else []),
+        "marcas": [[round((c["hi_i"] - s0) / max(1, len(serie) - 1), 4), round((c["lo_i"] - s0) / max(1, len(serie) - 1), 4)] for c in contr],
+    }
+
 # ---------------------------------------------------------------- score
-def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv):
+def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv, vcp=None):
     tend = mv / 8 * 20
     fuer = rs / 99 * 25
     contr = (comp_d["score"] if comp_d else 0) / 100 * 35
@@ -484,6 +619,11 @@ def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv):
     if comp_d_rup: setup += 6
     if ins_d and ins_d.get("n", 0) >= 1: setup += 3 if ins_d["n"] == 1 else 5
     if piv and piv.get("estado") != "esperando": setup += 4
+    if vcp:
+        e = vcp["estado"]
+        if e == "armada": setup += 6
+        elif e == "recien": setup += 8 if (vcp["vol_rup"] or 0) >= VOL_RUPTURA else 4
+        elif e == "confirmo": setup += 4
     return {"tend": num(tend, 1), "rs": num(fuer, 1), "contr": num(contr, 1), "setup": num(min(setup, 20), 1)}
 
 def spark(s, n): return [num(x, 4) for x in s.iloc[-n:].values]
@@ -539,7 +679,10 @@ def correr():
             lst = [estado_avwap(d, nom, i, tf) for nom, i in anclas(d, tf, earn, es_ipo, ep["_ts"] if ep else None)]
             av[tf] = [x for x in lst if x]
         activo_av = any(x["estado"] in ("rompe", "por romper") for tf in av for x in av[tf])
-        if EXIGIR_AVWAP and not activo_av: continue
+        vcp = detectar_vcp(df)
+        # Sin AVWAP activa: igual entra si tiene una base VCP o tocó una EMA diaria (se muestra solo en esas secciones)
+        sin_av = bool(EXIGIR_AVWAP and not activo_av)
+        if sin_av and not vcp and not (ANALIZAR_30M and toque_ema_diaria(df)): continue
         comp = {"d": compresion(df, "d"), "w": compresion(wk, "w")}
         ins = {"d": inside(df), "w": inside(wk)}
         sav = {"d": setup_avwap(df, av["d"]), "w": setup_avwap(wk, av["w"])}
@@ -549,25 +692,29 @@ def correr():
             "precio": num(c.iloc[-1], 4), "chg": num((c.iloc[-1] / c.iloc[-2] - 1) * 100),
             "ret21": num(ret21[t] * 100, 1), "rs": num(rs, 0), "mv": sum(checks), "mv_checks": checks,
             "hi52": num(hi, 4), "lo52": num(lo, 4), "pos52": num((c.iloc[-1] - lo) / (hi - lo) * 100 if hi > lo else 100, 0),
-            "avwap": av, "comp": comp, "inside": ins, "setup_av": sav, "pivot30": None,
+            "avwap": av, "comp": comp, "inside": ins, "setup_av": sav, "pivot30": None, "vcp": vcp, "sin_av": sin_av,
             "earn_prox": prox.strftime("%d-%m-%Y") if prox is not None else None,
             "adr": num(adr_pct(df), 2), "earn_dias": earn_dias, "earn_momento": momento_earnings(prox),
             "ep": {k: v for k, v in ep.items() if not k.startswith("_")} if ep else None,
             "estadio": estadio(df), "flags": banderas(df, sav["d"], earn_dias),
             "spark_d": spark(c, 63), "spark_w": spark(wk.Close, 30), "_r21p": float(r21_pct.get(t, 50)),
         })
-    print(f"   {len(activos)} cumplen todos los requisitos")
+    n_req = sum(1 for a in activos if not a["sin_av"])
+    print(f"   {n_req} cumplen todos los requisitos")
     con30 = bool(ANALIZAR_30M and activos)
     if con30:
-        print("5/5 Buscando pivots de 30 minutos…")
+        print(f"5/5 Buscando pivots de 30 minutos (incluye las que no tienen AVWAP activa)…")
         m30 = descargar([a["t"] for a in activos], "5d", "30m")
         for a in activos:
             a["pivot30"] = pivot_30m(m30.get(a["t"]), dfs_d.get(a["t"]))
+        activos = [a for a in activos if not a["sin_av"] or a["pivot30"] or a["vcp"]]
     else:
         print("5/5 Intradía desactivado")
+        activos = [a for a in activos if not a["sin_av"] or a["vcp"]]
+    print(f"   {sum(1 for a in activos if a['vcp'])} con base VCP")
     for a in activos:
         p = partes_score(a["mv"], a["rs"], a["comp"]["d"], a["setup_av"]["d"],
-                         a["comp"]["d"] and a["comp"]["d"]["ruptura"], a["inside"]["d"], a["pivot30"])
+                         a["comp"]["d"] and a["comp"]["d"]["ruptura"], a["inside"]["d"], a["pivot30"], a["vcp"])
         a["partes"] = p
         a["score"] = num(sum(v for v in p.values() if v), 1)
         a["calor"] = num(0.6 * a["score"] + 0.4 * a.pop("_r21p"), 1)
@@ -580,7 +727,10 @@ def correr():
                    "dist_d": DIST_POR_ROMPER_DIARIO, "dist_w": DIST_POR_ROMPER_SEMANAL,
                    "velas_d": VELAS_RUPTURA_DIARIO, "velas_w": VELAS_RUPTURA_SEMANAL, "emas_30m": lista_emas(),
                    "vol_ruptura": VOL_RUPTURA, "adr_min": ADR_MINIMO, "cerca_gatillo": CERCA_GATILLO,
-                   "ep_suba": EP_MIN_SUBA, "ep_vol": EP_MIN_VOL}},
+                   "ep_suba": EP_MIN_SUBA, "ep_vol": EP_MIN_VOL,
+                   "vcp_min": VCP_MIN_CONTRACCIONES, "vcp_ult": VCP_ULTIMA_MAX, "vcp_dist": VCP_DIST_PIVOT,
+                   "vcp_seco": VCP_VOL_SECO, "vcp_dias": VCP_DIAS_RUPTURA, "vcp_seg": VCP_DIAS_SEGUIMIENTO,
+                   "vcp_smin": VCP_SEMANAS_MIN, "vcp_smax": VCP_SEMANAS_MAX}},
         "activos": sorted(activos, key=lambda a: -a["score"])}
     html = PLANTILLA.replace("__DATA__", json.dumps(datos, ensure_ascii=False, allow_nan=False, default=str))
     print(f"Listo en {time.time() - t0:.0f} s")
@@ -591,6 +741,8 @@ PLANTILLA = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>Radar de rupturas</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -655,6 +807,14 @@ header.top p{margin:6px 0 0;color:var(--muted);font-size:14px;max-width:70ch}
 input[type=search]{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:8px 14px;color:var(--text);font:inherit;font-size:14px;width:170px}
 .chipmeta{font-size:12.5px;color:var(--muted);padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card)}
 .demo{color:var(--warn);font-weight:700;margin-left:6px}
+.chipmeta{display:inline-flex;align-items:center;gap:8px}
+.refr{font:inherit;font-size:12.5px;font-weight:700;color:var(--acc);background:none;border:0;padding:0;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.refr svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.refr.gira svg{animation:gira .8s linear infinite}
+@keyframes gira{to{transform:rotate(360deg)}}
+.viejo{display:none;margin:-8px 0 18px;padding:10px 14px;border-radius:12px;font-size:13.5px;border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);background:color-mix(in srgb,var(--warn) 12%,transparent)}
+.viejo.on{display:block}
+.sin_av{font-size:11px;font-weight:700;color:var(--muted);border:1px solid var(--line2);border-radius:6px;padding:1px 5px;margin-left:6px;white-space:nowrap}
 
 /* Tarjetas */
 .card{background:linear-gradient(155deg,var(--card2) 0%,var(--card) 60%);border:1px solid var(--line);border-radius:20px;padding:18px 20px;box-shadow:var(--sombra);min-width:0}
@@ -739,6 +899,12 @@ tbody tr:hover td{background:color-mix(in srgb,var(--acc) 5%,transparent)}
 .est.rompe,.est.disparado,.est.rompio{background:color-mix(in srgb,var(--up) 15%,transparent);color:var(--up)}
 .est.porromper,.est.armado,.est.preparada{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
 .est.otro{color:var(--muted)}
+.est.falla{background:color-mix(in srgb,var(--down) 15%,transparent);color:var(--down)}
+.contr{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.contr i{font-style:normal;color:var(--faint)}
+.contr b{font-weight:600}
+.contr b:last-child{color:var(--acc)}
+.vcpg{width:100%;height:auto;display:block;margin-top:8px}
 .fl{display:inline-block;margin-left:5px;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:700;vertical-align:1px}
 .fl.bad{background:color-mix(in srgb,var(--down) 15%,transparent);color:var(--down)}
 .fl.good{background:color-mix(in srgb,var(--up) 15%,transparent);color:var(--up)}
@@ -819,6 +985,7 @@ footer{color:var(--faint);font-size:12.5px;margin-top:40px;max-width:95ch}
         <input type="search" id="q" placeholder="Buscar ticker" aria-label="Buscar ticker">
       </div>
     </header>
+    <div class="viejo" id="viejo" role="status"></div>
     <div id="vista"></div>
     <footer id="pie"></footer>
   </main>
@@ -828,7 +995,7 @@ footer{color:var(--faint);font-size:12.5px;margin-top:40px;max-width:95ch}
 
 <script>
 const D = __DATA__;
-const S = {pag:'inicio', tf:'d', tipo:'todo', q:'', insideMin:1, soloComp:true, sector:null, emaF:0, epHoy:false};
+const S = {vcpF:'', pag:'inicio', tf:'d', tipo:'todo', q:'', insideMin:1, soloComp:true, sector:null, emaF:0, epHoy:false};
 const P = D.meta.params;
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -838,7 +1005,8 @@ const pct = (v,d=2) => (v==null||isNaN(v)) ? '–' : (v>0?'+':'')+fmt(v,d)+'%';
 const cls = v => v>0 ? 'up' : v<0 ? 'down' : 'mut';
 const TFN = {d:'diario', w:'semanal'};
 const EST = {'rompe':['rompe','Rompiendo'],'por romper':['porromper','Por romper'],'arriba':['otro','Arriba'],'abajo':['otro','Abajo'],
-  'disparado':['disparado','Disparado'],'armado':['armado','Armado'],'esperando':['otro','Esperando'],'rompio':['rompio','Rompió'],'preparada':['preparada','Preparada']};
+  'disparado':['disparado','Disparado'],
+  'armada':['armado','Armada'],'recien':['rompio','Recién rompió'],'confirmo':['rompe','Confirmó'],'formandose':['otro','Formándose'],'fallo':['falla','Falló'],'armado':['armado','Armado'],'esperando':['otro','Esperando'],'rompio':['rompio','Rompió'],'preparada':['preparada','Preparada']};
 const badge = e => { const x = EST[e] || ['otro', e]; return `<span class="est ${x[0]}">${x[1]}</span>`; };
 const ESTADIOS = {1:'Estadio 1 · base',2:'Estadio 2 · tendencia alcista',3:'Estadio 3 · techo',4:'Estadio 4 · tendencia bajista'};
 
@@ -847,6 +1015,7 @@ const IC = {
   sectores:'<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/>',
   avwap:'<path d="M3 17c3-1 5-6 8-6s4 3 7 1 3-5 3-5"/><path d="M3 12h18" stroke-dasharray="2 3"/>',
   comp:'<path d="M4 7h16M7 12h10M10 17h4"/>',
+  vcp:'<path d="M2 8l4 9 4-7 3 5 3-3 2 2 4-8"/>',
   inside:'<rect x="3" y="3" width="18" height="18" rx="3"/><rect x="8" y="8" width="8" height="8" rx="2"/>',
   ep:'<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
   setups:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.2"/>',
@@ -857,6 +1026,7 @@ const PAGS = [
   ['inicio','Inicio','Panorama del mercado y lo más destacado del día.'],
   ['sectores','Sectores','Las 5 más calientes de cada sector. El calor combina el score (60%) con el retorno del último mes relativo al universo (40%).'],
   ['avwap','AVWAP','AVWAP ancladas a earnings, episodic pivots, días de alto volumen, máximo estructural, máximo histórico e IPO reciente.'],
+  ['vcp','VCP','Bases con contracciones de volatilidad cada vez más chicas y volumen que se seca (Minervini). El pivot es el máximo de la última contracción.'],
   ['comp','Compresión','Activos apretados en precio (ATR y ancho de Bollinger) y en volumen.'],
   ['inside','Inside','Velas con máximo y mínimo dentro de la vela anterior. El gatillo alcista es el máximo de la vela madre.'],
   ['ep','Episodic','Días con suba fuerte y volumen explosivo: posible entrada institucional y nuevo ancla de AVWAP.'],
@@ -880,9 +1050,9 @@ function ring(v, size=70, col='var(--acc)'){
     <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="${col}" stroke-width="6" stroke-linecap="round"
       stroke-dasharray="${(c*v/100).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 ${size/2} ${size/2})"/></svg><b>${fmt(v,0)}</b></div>`;
 }
-function visibles(){
+function visibles(conSolo30=false){
   const q = S.q.trim().toLowerCase();
-  return D.activos.filter(a => (S.tipo==='todo' || a.tipo===S.tipo) &&
+  return D.activos.filter(a => (conSolo30 || !a.sin_av) && (S.tipo==='todo' || a.tipo===S.tipo) &&
     (!q || a.t.toLowerCase().includes(q) || (a.nombre||'').toLowerCase().includes(q)));
 }
 function mejorAv(a, tf){
@@ -915,7 +1085,7 @@ function vInicio(){
     ['comp', act.filter(a=>a.comp[tf]&&a.comp[tf].es).length, `comprimidos (${TFN[tf]})`, 'comp'],
     ['inside', act.filter(a=>a.inside[tf]&&a.inside[tf].n>=1).length, `con inside ${tf==='d'?'day':'week'}`, 'inside'],
     ['ep', act.filter(a=>a.ep).length, 'episodic pivots (10 ruedas)', 'ep'],
-    ['setups', act.filter(a=>a.setup_av[tf]||(a.pivot30&&a.pivot30.estado!=='esperando')).length, 'con algún setup activo', 'setups'],
+    ['setups', visibles(true).filter(a=>(!a.sin_av&&a.setup_av[tf]) || (a.pivot30&&a.pivot30.estado!=='esperando') || (a.vcp&&['armada','recien'].includes(a.vcp.estado))).length, 'con algún setup activo', 'setups'],
   ];
   const kpis = `<div class="kpis">${k.map(([ic,v,l,p])=>`<button class="card kpi" data-ir="${p}"><span class="ic">${ico(ic)}</span><b>${v}</b><span>${l}</span></button>`).join('')}</div>`;
   const reg = R ? `<div class="card"><h3>Régimen de mercado <small>contexto para dimensionar</small></h3>
@@ -981,6 +1151,47 @@ function vAvwap(){
   const por = rows.filter(r=>r.x.estado==='por romper').sort((p,q)=>q.x.dist-p.x.dist);
   return `<p class="nota">"Rompiendo" = cerró arriba en las últimas ${tf==='d'?P.velas_d:P.velas_w} velas; "por romper" = hasta ${tf==='d'?P.dist_d:P.dist_w}% debajo. El objetivo es el máximo desde donde sale la AVWAP.</p>
   <div class="grid g2">${card('Rompiendo', rom.length, tabla(cols, rom, 'Nada rompiendo en '+TFN[tf]+'.'))}${card('Por romper', por.length, tabla(cols, por, 'Nada a punto de romper en '+TFN[tf]+'.'))}</div>`;
+}
+
+/* ---------- VCP ---------- */
+const sinAv = a => a.sin_av ? '<span class="sin_av" title="No cumple el requisito de AVWAP: aparece solo por este setup">sin AVWAP</span>' : '';
+const contrTxt = v => `<span class="contr">${(v.contr||[]).map(x=>`<b>${fmt(x,0)}%</b>`).join('<i>→</i>')}</span>`;
+function vVcp(){
+  const ORD = {recien:0, armada:1, confirmo:2, formandose:3, fallo:4};
+  const todos = visibles(true).filter(a=>a.vcp);
+  const l = todos.filter(a=>!S.vcpF || a.vcp.estado===S.vcpF)
+    .sort((x,y)=>(ORD[x.vcp.estado]-ORD[y.vcp.estado]) || (Math.abs(x.vcp.dist)-Math.abs(y.vcp.dist)));
+  const F = [['','Todas'],['recien','Recién rompió'],['armada','Armada'],['confirmo','Confirmó'],['formandose','Formándose'],['fallo','Falló']];
+  const cols = [
+    {h:'Ticker', f:r=>tk(r.a)+sinAv(r.a)},
+    {h:'Estado', f:r=>badge(r.a.vcp.estado)},
+    {h:'Contracciones', f:r=>contrTxt(r.a.vcp)},
+    {h:'Base', n:1, f:r=>fmt(r.a.vcp.semanas,0)+' sem.'},
+    {h:'Pivot', n:1, f:r=>pr(r.a.vcp.pivot)},
+    {h:'Stop', n:1, f:r=>pr(r.a.vcp.stop)},
+    {h:'Riesgo', n:1, f:r=>fmt(r.a.vcp.riesgo,1)+'%'},
+    {h:'Precio vs. pivot', n:1, f:r=>`<span class="${cls(r.a.vcp.dist)}">${pct(r.a.vcp.dist)}</span>`},
+    {h:'Volumen en la última', n:1, f:r=>r.a.vcp.seco!=null ? `<span class="${r.a.vcp.seco<P.vcp_seco?'up':'mut'}">${fmt(r.a.vcp.seco,2)}x</span>` : '–'},
+    {h:'Vol. ruptura', n:1, f:r=>r.a.vcp.vol_rup!=null ? `<span class="${r.a.vcp.vol_rup>=P.vol_ruptura?'up':'down'}">${fmt(r.a.vcp.vol_rup,1)}x</span>` : '–'},
+  ];
+  return `<div class="filtros">${F.map(([k,n])=>`<button class="chip" data-vcp="${k}" aria-pressed="${S.vcpF===k}">${n} <span class="mut">${k?todos.filter(a=>a.vcp.estado===k).length:todos.length}</span></button>`).join('')}</div>
+  <p class="nota">Contracciones: cuánto cayó el precio en cada retroceso de la base, de la más vieja a la más nueva; tienen que ser cada vez más chicas (al menos ${P.vcp_min}). "Formándose" = la última todavía no está apretada o el precio está lejos del pivot. "Armada" = última contracción de ${fmt(P.vcp_ult,0)}% o menos, volumen por debajo del promedio de 50 ruedas y precio a ${fmt(P.vcp_dist,0)}% o menos del pivot. "Recién rompió" = cerró sobre el pivot en las últimas ${P.vcp_dias} ruedas; "confirmó" = se sostiene arriba; "falló" = volvió a cerrar debajo del pivot. El volumen de ruptura en verde es de ${fmt(P.vol_ruptura,1)}x o más. Solo en diario.</p>
+  ${card('Bases VCP', l.length, tabla(cols, l.map(a=>({a})), 'Ninguna base VCP con este filtro.'))}`;
+}
+function graficoVcp(v){
+  const s = v.serie||[]; if(s.length<2) return '';
+  const W=420, H=150, pad=6;
+  const mn = Math.min(...s, v.stop)*0.99, mx = Math.max(...s, v.pivot)*1.01, r = mx-mn||1;
+  const X = f => (pad + f*(W-2*pad)).toFixed(1), Y = y => (H-pad-(y-mn)/r*(H-2*pad)).toFixed(1);
+  const pts = s.map((y,i)=>`${X(i/(s.length-1))},${Y(y)}`).join(' ');
+  const at = f => s[Math.min(s.length-1, Math.round(f*(s.length-1)))];
+  const dots = (v.marcas||[]).map(([h,l])=>`<circle cx="${X(h)}" cy="${Y(at(h))}" r="3" fill="var(--muted)"/><circle cx="${X(l)}" cy="${Y(at(l))}" r="3" fill="var(--violet)"/>`).join('');
+  return `<svg class="vcpg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Base VCP con pivot y stop">
+    <line x1="0" x2="${W}" y1="${Y(v.pivot)}" y2="${Y(v.pivot)}" stroke="var(--acc)" stroke-dasharray="4 4" stroke-width="1.2"/>
+    <line x1="0" x2="${W}" y1="${Y(v.stop)}" y2="${Y(v.stop)}" stroke="var(--down)" stroke-dasharray="4 4" stroke-width="1.2"/>
+    <polyline points="${pts}" fill="none" stroke="var(--text)" stroke-width="1.5" stroke-linejoin="round"/>${dots}
+    <text x="${W-4}" y="${+Y(v.pivot)-5}" text-anchor="end" font-size="11" fill="var(--acc)">pivot ${pr(v.pivot)}</text>
+    <text x="${W-4}" y="${+Y(v.stop)+14}" text-anchor="end" font-size="11" fill="var(--down)">stop ${pr(v.stop)}</text></svg>`;
 }
 
 /* ---------- Compresión ---------- */
@@ -1076,10 +1287,10 @@ function vSetups(){
     {h:'Compresión', f:r=>barra(r.a.comp[tf].score)},
   ];
   const ORD = {disparado:0, armado:1, esperando:2};
-  const pv = act.filter(a=>a.pivot30 && (!S.emaF || a.pivot30.ema_n===S.emaF)).map(a=>({a, p:a.pivot30}))
+  const pv = visibles(true).filter(a=>a.pivot30 && (!S.emaF || a.pivot30.ema_n===S.emaF)).map(a=>({a, p:a.pivot30}))
     .sort((p,q)=> (ORD[p.p.estado]-ORD[q.p.estado]) || ((p.p.riesgo??99)-(q.p.riesgo??99)));
   const cPv = [
-    {h:'Ticker', f:r=>tk(r.a)},
+    {h:'Ticker', f:r=>tk(r.a)+(r.a.sin_av?'<span class="sin_av" title="No cumple el requisito de AVWAP: aparece solo por este setup">sin AVWAP</span>':'')},
     {h:'Estado', f:r=>badge(r.p.estado)},
     {h:'EMA diaria', f:r=>`<span class="tk">EMA${r.p.ema_n}</span> <span class="mut">${esc(r.p.toque)} · ${pr(r.p.ema)}</span>`},
     {h:'Entrada (máx. vela verde)', n:1, f:r=>pr(r.p.entrada)},
@@ -1096,7 +1307,7 @@ function vSetups(){
   ${card('Compresiones', cb.length, tabla(cCb, cb, 'Ninguna ruptura de compresión en '+TFN[tf]+'.'))}
   <h2 class="sec">30 Min Pivot <small>undercut de EMA diaria + primera vela verde</small></h2>
   <div class="filtros">${[0].concat(P.emas_30m).map(e=>`<button class="chip" data-ema="${e}" aria-pressed="${S.emaF===e}">${e?'EMA'+e:'Todas las EMA'}</button>`).join('')}</div>
-  <p class="nota">En diario, el precio tocó o perforó (undercut) alguna de las EMA ${P.emas_30m.join(', ')}, hoy o ayer. En 30 min, la primera vela verde después del mínimo marca la entrada (su máximo) y el stop (su mínimo). "Esperando" = tocó la EMA pero todavía no hay vela verde; "armado" = hay vela verde y no superó su máximo; "disparado" = superó el máximo en las últimas 3 horas.${D.meta.con30m ? '' : ' El análisis intradía estaba desactivado en esta corrida.'}</p>
+  <p class="nota">En diario, el precio tocó o perforó (undercut) alguna de las EMA ${P.emas_30m.join(', ')}, hoy o ayer. En 30 min, la primera vela verde después del mínimo marca la entrada (su máximo) y el stop (su mínimo). "Esperando" = tocó la EMA pero todavía no hay vela verde; "armado" = hay vela verde y no superó su máximo; "disparado" = superó el máximo en las últimas 3 horas. Acá entran también las que cumplen Minervini, precio y ADR aunque no estén rompiendo ni por romper una AVWAP (marcadas "sin AVWAP"); esas aparecen solo acá y en VCP.${D.meta.con30m ? '' : ' El análisis intradía estaba desactivado en esta corrida.'}</p>
   ${card('30 Min Pivot', pv.length, tabla(cPv, pv, 'Ninguna acción tocó sus EMAs diarias hoy o ayer.'))}`;
 }
 
@@ -1115,6 +1326,7 @@ function ficha(t){
     <div class="fh"><div><h2>${esc(a.t)}</h2><p>${esc(a.nombre)} · ${esc(a.sector)}</p></div><button class="cerrar" id="cerrar" aria-label="Cerrar ficha">✕</button></div>
     <div class="precio">${pr(a.precio)} <span class="${cls(a.chg)}">${pct(a.chg)}</span></div>
     <div style="margin-top:12px">${spark(a.spark_d, 420, 72)}</div>
+    ${a.sin_av ? `<p class="nota" style="margin-top:12px">No está rompiendo ni por romper ninguna AVWAP: cumple Minervini, precio y ADR, y aparece solo en VCP y en el 30 Min Pivot.</p>` : ''}
     ${(a.flags||[]).length ? `<h4>Avisos</h4><div class="flist">${a.flags.map(f=>`<div class="${f.tipo}">${esc(f.t)}</div>`).join('')}</div>` : ''}
     <h4>Score</h4>
     <div style="display:flex;gap:18px;align-items:center">${ring(a.score, 84)}
@@ -1124,6 +1336,12 @@ function ficha(t){
     <h4>Rango de 52 semanas · ${fmt(a.pos52,0)}%</h4>
     <div class="rango"><i style="left:${Math.max(0,Math.min(100,a.pos52))}%"></i></div>
     <div class="rl"><span>${pr(a.lo52)}</span><span>${pr(a.hi52)}</span></div>
+    ${a.vcp ? `<h4>Base VCP · ${badge(a.vcp.estado)}</h4>${graficoVcp(a.vcp)}
+      <div class="kv" style="margin-top:10px"><span>Contracciones</span><span>${contrTxt(a.vcp)}</span>
+      <span>Base</span><span>${fmt(a.vcp.semanas,0)} semanas desde ${esc(a.vcp.inicio)}</span>
+      <span>Pivot / stop</span><span>${pr(a.vcp.pivot)} / ${pr(a.vcp.stop)} · riesgo ${fmt(a.vcp.riesgo,1)}%</span>
+      <span>Volumen en la última</span><span>${a.vcp.seco!=null?fmt(a.vcp.seco,2)+'x el promedio':'–'}</span>
+      ${a.vcp.vol_rup!=null?`<span>Volumen de ruptura</span><span>${fmt(a.vcp.vol_rup,1)}x · hace ${a.vcp.dias_rup} ruedas</span>`:''}</div>` : ''}
     <h4>AVWAP diario</h4>${avt('d')}
     <h4>AVWAP semanal</h4>${avt('w')}
     <h4>Estructura</h4>
@@ -1144,7 +1362,7 @@ function cerrarFicha(){ $('#ficha').classList.remove('open'); $('#velo').classLi
 
 /* ---------- Navegación y eventos ---------- */
 const CORTO = {comp:'Compr.', sectores:'Sectores', episodic:'EP'};
-const VISTAS = {inicio:vInicio, sectores:vSectores, avwap:vAvwap, comp:vComp, inside:vInside, ep:vEp, setups:vSetups};
+const VISTAS = {inicio:vInicio, sectores:vSectores, avwap:vAvwap, vcp:vVcp, comp:vComp, inside:vInside, ep:vEp, setups:vSetups};
 $('#rail').innerHTML = `<div class="logo">${'<svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>'}</div>` +
   PAGS.map(([k,n])=>`<button data-pag="${k}" aria-current="${S.pag===k?'page':'false'}">${ico(k)}<span class="lg">${n}</span><span class="ct">${CORTO[k]||n}</span></button>`).join('');
 function ir(p){
@@ -1169,6 +1387,7 @@ $('#vista').addEventListener('click', e => {
   const k = e.target.closest('[data-ir]'); if(k){ ir(k.dataset.ir); return; }
   const sec = e.target.closest('.sec-t'); if(sec){ S.sector = S.sector===sec.dataset.sec ? null : sec.dataset.sec; render(); return; }
   if(e.target.closest('#solo')){ S.soloComp = !S.soloComp; render(); return; }
+  const vf = e.target.closest('[data-vcp]'); if(vf){ S.vcpF = vf.dataset.vcp; render(); return; }
   const em = e.target.closest('[data-ema]'); if(em){ S.emaF = +em.dataset.ema; render(); return; }
   const eh = e.target.closest('[data-ephoy]'); if(eh){ S.epHoy = eh.dataset.ephoy==='1'; render(); return; }
   const ch = e.target.closest('[data-in]'); if(ch){ S.insideMin = +ch.dataset.in; render(); return; }
@@ -1180,7 +1399,43 @@ $('#velo').addEventListener('click', cerrarFicha);
 document.addEventListener('keydown', e => { if(e.key==='Escape') cerrarFicha(); });
 
 const m = D.meta;
-$('#meta').innerHTML = `Actualizado ${esc(m.generado)}${m.demo ? '<span class="demo">· datos simulados</span>' : ''}`;
+$('#meta').innerHTML = `<span>Actualizado ${esc(m.generado)}</span>${m.demo ? '<span class="demo">· datos simulados</span>' : ''}<button class="refr" id="refr" aria-label="Actualizar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg>Actualizar</button>`;
+
+/* ---------- Recarga y aviso de datos viejos ---------- */
+// "dd-mm-aaaa hh:mm" en hora de Argentina (UTC-3) -> fecha real
+function fechaAR(t){ const x = /(\d+)-(\d+)-(\d+) (\d+):(\d+)/.exec(t||''); return x ? new Date(Date.UTC(+x[3], x[2]-1, +x[1], +x[4]+3, +x[5])) : null; }
+function recargar(){ $('#refr').classList.add('gira'); location.replace(location.pathname + '?v=' + Date.now()); }
+async function hayNueva(){
+  try{
+    const r = await fetch(location.pathname + '?v=' + Date.now(), {cache:'no-store'});
+    const x = /"generado":\s*"([^"]+)"/.exec(await r.text());
+    const nueva = x && fechaAR(x[1]), actual = fechaAR(m.generado);
+    return !!(nueva && actual && nueva > actual);
+  }catch(e){ return false; }
+}
+async function chequear(){ if(!m.demo && await hayNueva()) recargar(); }
+function avisoViejo(){
+  const g = fechaAR(m.generado); if(!g || m.demo) return;
+  const ar = new Date(Date.now() - 3*3600e3), dia = ar.getUTCDay(), mins = ar.getUTCHours()*60 + ar.getUTCMinutes();
+  const horas = (Date.now() - g) / 3600e3;
+  const enRueda = dia>=1 && dia<=5 && mins>=12*60+30 && mins<=20*60;
+  const el = $('#viejo');
+  if(enRueda && horas > 2){
+    el.innerHTML = `<b>Datos de hace ${horas<24 ? Math.floor(horas)+' horas' : Math.floor(horas/24)+' días'}.</b> En horario de mercado debería actualizarse cada hora: tocá Actualizar y, si sigue igual, revisá la pestaña Actions en GitHub por si falló una corrida.`;
+    el.classList.add('on');
+  } else el.classList.remove('on');
+}
+$('#refr').addEventListener('click', recargar);
+avisoViejo();
+setTimeout(chequear, 1500);
+let ultimo = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState !== 'visible') return;
+  avisoViejo();
+  if(Date.now() - ultimo > 60e3){ ultimo = Date.now(); chequear(); }
+});
+window.addEventListener('pageshow', e => { if(e.persisted){ avisoViejo(); chequear(); } });
+setInterval(() => { if(document.visibilityState==='visible'){ avisoViejo(); chequear(); } }, 5*60e3);
 $('#pie').innerHTML = `${m.n_universo} activos analizados. Requisitos: al menos ${P.min_mv} de 8 criterios de Minervini (${P.sobre_min}% sobre el mínimo y dentro del ${P.bajo_max}% del máximo de 52 semanas, RS ${P.rs_min}+), precio de ${P.precio_min} USD o más en acciones y ETF, ADR de ${fmt(P.adr_min,1)}% o más${P.exigir_av ? ', y rompiendo o por romper al menos una AVWAP' : ''}. Horarios en hora de Argentina. Esto es un filtro técnico, no una recomendación de compra.`;
 render();
 </script>
