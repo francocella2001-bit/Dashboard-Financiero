@@ -24,7 +24,10 @@ DIAS_TOQUE_EMA = 2
 # **Bases VCP**
 VCP_MIN_CONTRACCIONES = 2
 VCP_ULTIMA_MAX = 10.0
-VCP_PRIMERA_MAX = 50.0
+VCP_FORMANDO_MAX = 20.0
+VCP_PIVOT_ARRIBA = 60
+VCP_TOLERANCIA_MINIMO = 1.5
+VCP_PRIMERA_MAX = 35.0
 VCP_VOL_SECO = 1.0
 VCP_DIST_PIVOT = 5.0
 VCP_SEMANAS_MIN = 3
@@ -515,7 +518,7 @@ def _vcp_desde(j, piv, hi, lo):
     while k < len(piv):
         i, p, tp = piv[k]
         if tp == "L":
-            if contr and p < contr[-1]["lo"]:   # perfora el mínimo anterior: es la misma contracción
+            if contr and p < contr[-1]["lo"] * (1 - VCP_TOLERANCIA_MINIMO / 100):   # perfora el mínimo anterior: misma contracción
                 contr[-1].update(lo_i=i, lo=p)
             else:
                 contr.append({"hi_i": cur[0], "hi": cur[1], "lo_i": i, "lo": p})
@@ -532,7 +535,10 @@ def _depth(c): return (c["hi"] - c["lo"]) / c["hi"] * 100
 def _vcp_valida(contr):
     if len(contr) < VCP_MIN_CONTRACCIONES: return False
     d = [_depth(c) for c in contr]
-    return d[0] <= VCP_PRIMERA_MAX and all(d[x + 1] < d[x] for x in range(len(d) - 1))
+    if d[0] > VCP_PRIMERA_MAX or any(d[x + 1] >= d[x] for x in range(len(d) - 1)): return False
+    # el pivot tiene que estar en la parte alta de la base, no en el medio del rango
+    alto, bajo = contr[0]["hi"], min(c["lo"] for c in contr)
+    return alto > bajo and (contr[-1]["hi"] - bajo) / (alto - bajo) * 100 >= VCP_PIVOT_ARRIBA
 
 def detectar_vcp(df):
     """Detecta una base VCP en velas diarias y su estado."""
@@ -572,7 +578,8 @@ def detectar_vcp(df):
     pivot, stop = ult["hi"], ult["lo"]
     vol50 = pd.Series(vo).rolling(50).mean().values
     # ruptura: primer cierre sobre el pivot después del mínimo de la última contracción
-    b = next((x for x in range(ult["lo_i"] + 1, m) if cl[x] > pivot), None)
+    b = next((x for x in range(ult["lo_i"] + 1, m)
+              if cl[x] > pivot and vol50[x - 1] and vo[x] >= VOL_RUPTURA * vol50[x - 1]), None)
     # secado de volumen: promedio desde el inicio de la última contracción vs. promedio de 50 ruedas previo
     fin_c = (b - 1) if b is not None else m - 1
     ref = vol50[ult["hi_i"]] if not np.isnan(vol50[ult["hi_i"]]) else np.nanmean(vo[:ult["hi_i"] + 1])
@@ -588,8 +595,12 @@ def detectar_vcp(df):
     else:
         dist = (pivot / cl[-1] - 1) * 100
         if cl[-1] < stop: return None
-        est = "armada" if (_depth(ult) <= VCP_ULTIMA_MAX and seco is not None and seco < VCP_VOL_SECO
-                           and dist <= VCP_DIST_PIVOT) else "formandose"
+        if _depth(ult) <= VCP_ULTIMA_MAX and seco is not None and seco < VCP_VOL_SECO and dist <= VCP_DIST_PIVOT:
+            est = "armada"
+        elif _depth(ult) <= VCP_FORMANDO_MAX:
+            est = "formandose"
+        else:
+            return None
     fin = b if b is not None else m - 1
     semanas = (fin - i0) / 5
     if semanas < VCP_SEMANAS_MIN: return None
@@ -728,7 +739,7 @@ def correr():
                    "velas_d": VELAS_RUPTURA_DIARIO, "velas_w": VELAS_RUPTURA_SEMANAL, "emas_30m": lista_emas(),
                    "vol_ruptura": VOL_RUPTURA, "adr_min": ADR_MINIMO, "cerca_gatillo": CERCA_GATILLO,
                    "ep_suba": EP_MIN_SUBA, "ep_vol": EP_MIN_VOL,
-                   "vcp_min": VCP_MIN_CONTRACCIONES, "vcp_ult": VCP_ULTIMA_MAX, "vcp_dist": VCP_DIST_PIVOT,
+                   "vcp_min": VCP_MIN_CONTRACCIONES, "vcp_ult": VCP_ULTIMA_MAX, "vcp_form": VCP_FORMANDO_MAX, "vcp_dist": VCP_DIST_PIVOT,
                    "vcp_seco": VCP_VOL_SECO, "vcp_dias": VCP_DIAS_RUPTURA, "vcp_seg": VCP_DIAS_SEGUIMIENTO,
                    "vcp_smin": VCP_SEMANAS_MIN, "vcp_smax": VCP_SEMANAS_MAX}},
         "activos": sorted(activos, key=lambda a: -a["score"])}
@@ -1175,7 +1186,7 @@ function vVcp(){
     {h:'Vol. ruptura', n:1, f:r=>r.a.vcp.vol_rup!=null ? `<span class="${r.a.vcp.vol_rup>=P.vol_ruptura?'up':'down'}">${fmt(r.a.vcp.vol_rup,1)}x</span>` : '–'},
   ];
   return `<div class="filtros">${F.map(([k,n])=>`<button class="chip" data-vcp="${k}" aria-pressed="${S.vcpF===k}">${n} <span class="mut">${k?todos.filter(a=>a.vcp.estado===k).length:todos.length}</span></button>`).join('')}</div>
-  <p class="nota">Contracciones: cuánto cayó el precio en cada retroceso de la base, de la más vieja a la más nueva; tienen que ser cada vez más chicas (al menos ${P.vcp_min}). "Formándose" = la última todavía no está apretada o el precio está lejos del pivot. "Armada" = última contracción de ${fmt(P.vcp_ult,0)}% o menos, volumen por debajo del promedio de 50 ruedas y precio a ${fmt(P.vcp_dist,0)}% o menos del pivot. "Recién rompió" = cerró sobre el pivot en las últimas ${P.vcp_dias} ruedas; "confirmó" = se sostiene arriba; "falló" = volvió a cerrar debajo del pivot. El volumen de ruptura en verde es de ${fmt(P.vol_ruptura,1)}x o más. Solo en diario.</p>
+  <p class="nota">Contracciones: cuánto cayó el precio en cada retroceso de la base, de la más vieja a la más nueva; tienen que ser cada vez más chicas (al menos ${P.vcp_min}). El pivot tiene que estar en la parte alta de la base. "Formándose" = la última contracción es de ${fmt(P.vcp_form,0)}% o menos, pero todavía no está apretada o el precio está lejos del pivot. "Armada" = última contracción de ${fmt(P.vcp_ult,0)}% o menos, volumen por debajo del promedio de 50 ruedas y precio a ${fmt(P.vcp_dist,0)}% o menos del pivot. "Recién rompió" = cerró sobre el pivot con volumen de ${fmt(P.vol_ruptura,1)}x o más en las últimas ${P.vcp_dias} ruedas; "confirmó" = se sostiene arriba; "falló" = volvió a cerrar debajo del pivot. Solo en diario.</p>
   ${card('Bases VCP', l.length, tabla(cols, l.map(a=>({a})), 'Ninguna base VCP con este filtro.'))}`;
 }
 function graficoVcp(v){
