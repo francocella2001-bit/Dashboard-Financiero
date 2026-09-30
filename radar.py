@@ -713,9 +713,6 @@ def lista_foco(activos):
         v = a["vcp"]
         if v and v["estado"] in ("armada", "recien"):
             op.append(("VCP " + ("armada" if v["estado"] == "armada" else "recién rota"), v["pivot"], v["stop"]))
-        p = a["pivot30"]
-        if p and p["estado"] in ("armado", "disparado"):
-            op.append(("30 Min Pivot " + p["estado"], p["entrada"], p["stop"]))
         c = a["comp"]["d"]
         if c and c["emas"] and (c["ruptura"] or (c["es"] and c["dist_gatillo"] is not None and c["dist_gatillo"] <= CERCA_GATILLO)):
             op.append(("Compresión " + ("rota" if c["ruptura"] else "preparada"), c["gatillo"], c["piso"]))
@@ -1221,7 +1218,7 @@ function vInicio(){
     {h:'Score', n:1, f:r=>fmt(r.score,0)},
   ];
   const foco = `<div class="foco">${card('Lista de foco', fl.length ? fl.length+' para hoy' : null,
-    `<p class="nota" style="margin:0 0 10px">Hasta ${P.foco_max} activos con un setup listo (VCP armada o recién rota, 30 Min Pivot armado o disparado, compresión con EMAs en ascenso cerca del gatillo o rota, ruptura de AVWAP con volumen), RS ${P.foco_rs}+, riesgo de ${fmt(P.foco_riesgo,0)}% o menos y sin banderas (estirada de la EMA10/20, extendido, sin volumen, rechazo, earnings en 7 días). Ordenados por score.${R && R.score<40 ? ' <b>Régimen defensivo: tamaño chico o esperar.</b>' : ''}</p>`
+    `<p class="nota" style="margin:0 0 10px">Hasta ${P.foco_max} activos con un setup listo (VCP armada o recién rota, compresión con EMAs en ascenso cerca del gatillo o rota, ruptura de AVWAP con volumen), RS ${P.foco_rs}+, riesgo de ${fmt(P.foco_riesgo,0)}% o menos y sin banderas (estirada de la EMA10/20, extendido, sin volumen, rechazo, earnings en 7 días). Ordenados por score.${R && R.score<40 ? ' <b>Régimen defensivo: tamaño chico o esperar.</b>' : ''}</p>`
     + tabla(cFo, fl.map(r=>({...r, a:idx[r.t]})), 'Ningún setup cumple todo hoy. Mejor esperar que forzar.'))}</div>`;
   const PT = [['Tendencia','tend',20,'var(--blue)'],['Fuerza RS','rs',25,'var(--acc)'],['Contracción','contr',35,'var(--violet)'],['Setup','setup',20,'var(--warn)']];
   const spot = top.length ? `<div class="grid g3">${top.map(a=>`<div class="card spot" data-t="${esc(a.t)}" tabindex="0">
