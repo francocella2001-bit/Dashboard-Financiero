@@ -77,6 +77,8 @@ VCP_LEJOS_MAXIMO_52S = 15     # % máximo del pivot por debajo del máximo de 52
 VCP_VOL_DECRECIENTE = True    # el volumen de la última contracción tiene que ser menor que el de la primera
 VCP_CIERRES_ADR = 1.5         # "armada": los últimos 5 cierres dentro de este múltiplo del ADR (lado derecho quieto)
 VCP_SOBRE_EMA50 = True
+COMP_RANGO_ADR = 3.0          # compresión: el rango de las últimas 10 velas (6 en semanal) tiene que entrar en este múltiplo del ADR
+COMP_DERIVA_ADR = 1.5         # compresión: el precio no puede haberse movido más de esto (en ADR) en esas velas; si no, es una suba o una caída, no una pausa
 FORMA_VELAS_DIARIO = 25       # velas que se miran para clasificar la forma de una compresión (triángulo, rango plano, bandera)
 FORMA_VELAS_SEMANAL = 12        # "armada" y "formándose": precio sobre la EMA50
 # **Cierres semanales apretados (TC)**
@@ -972,8 +974,12 @@ def _met_comp(df, tf):
     rango = (df.High.iloc[-rg:].max() - df.Low.iloc[-rg:].min()) / c.iloc[-1] * 100
     s = 100 * (0.35 * np.clip((1.2 - atr_r) / 0.6, 0, 1) + 0.35 * np.clip(1 - bb_pct / 100, 0, 1)
                + 0.30 * np.clip((1.2 - vol_r) / 0.6, 0, 1))
-    es = atr_r < 0.85 and bb_pct <= 30 and vol_r < 0.95
+    adr = max(adr_pct(df), 0.3)
+    deriva = abs(c.iloc[-1] / c.iloc[-rg] - 1) * 100
+    lateral = rango <= COMP_RANGO_ADR * adr and deriva <= COMP_DERIVA_ADR * adr
+    es = atr_r < 0.85 and bb_pct <= 30 and vol_r < 0.95 and lateral
     return {"atr_r": atr_r, "bb_pct": bb_pct, "vol_r": vol_r, "rango": rango, "score": s, "es": bool(es),
+            "rango_adr": rango / adr, "deriva_adr": deriva / adr,
             "gatillo": df.High.iloc[-rg:].max(), "piso": df.Low.iloc[-rg:].min(), "rg": rg, "vl": vl}
 
 def emas_en_ascenso(df):
@@ -1008,11 +1014,23 @@ def compresion(df, tf):
     ruptura = bool(ant and ant["es"] and df.Close.iloc[-1] > ant["gatillo"] and vol_hoy >= VOL_RUPTURA)
     gat = ant["gatillo"] if ruptura else m["gatillo"]
     piso = ant["piso"] if ruptura else m["piso"]
+    # desde cuándo viene comprimida: velas seguidas que cumplen la condición (hasta ayer si hoy rompió)
+    dias, desde, base = 0, None, df.iloc[-(330 if tf == "d" else 200):]
+    if m["es"] or ruptura:
+        k = 1 if ruptura else 0
+        while k < 60:
+            x = _met_comp(base.iloc[:len(base) - k], tf)
+            if not x or not x["es"]: break
+            dias += 1; desde = base.index[len(base) - 1 - k]; k += 1
+    if desde is not None and tf != "d": desde = desde - pd.Timedelta(days=desde.weekday())   # semanal: el lunes de esa semana
+    ref = ant if ruptura else m
     return {"score": num(m["score"], 1), "es": m["es"], "atr_r": num(m["atr_r"]), "bb_pct": num(m["bb_pct"], 0),
             "vol_r": num(m["vol_r"]), "rango": num(m["rango"], 1), "gatillo": num(gat, 4),
             "dist_gatillo": num((gat / df.Close.iloc[-1] - 1) * 100), "ruptura": ruptura, "vol_hoy": num(vol_hoy, 2),
             "piso": num(piso, 4), "riesgo": num((gat - piso) / gat * 100, 1) if gat > 0 else None,
-            "emas": emas_en_ascenso(df), "forma": forma_compresion(df, tf)}
+            "emas": emas_en_ascenso(df), "forma": forma_compresion(df, tf),
+            "dias": dias, "desde": desde.strftime("%d-%m") if desde is not None else None,
+            "rango_adr": num(ref["rango_adr"], 1), "deriva_adr": num(ref["deriva_adr"], 1)}
 
 def inside(df):
     h, l = df.High.values, df.Low.values
@@ -1851,7 +1869,7 @@ def correr():
                    "vcp_min": VCP_MIN_CONTRACCIONES, "vcp_ult": VCP_ULTIMA_MAX, "vcp_form": VCP_FORMANDO_MAX, "vcp_dist": VCP_DIST_PIVOT,
                    "vcp_seco": VCP_VOL_SECO, "vcp_dias": VCP_DIAS_RUPTURA, "vcp_seg": VCP_DIAS_SEGUIMIENTO,
                    "vcp_smin": VCP_SEMANAS_MIN, "vcp_smax": VCP_SEMANAS_MAX, "emas_asc": EMAS_ASCENSO,
-                   "fuertes": ANCLAS_FUERTES, "exigir_rs": EXIGIR_RS, "castigo": SCORE_CASTIGO_BANDERA, "fuerte": CRECIMIENTO_FUERTE, "tc_min": TC_MIN_CIERRES, "tc_rango": TC_RANGO_MAX, "tc_cerca": TC_CERCA_PIVOT, "cruce_sem": CRUCE_SEMANAS, "rsi_alto": RSI_SOBRECOMPRA, "zona_compra": ZONA_COMPRA_MAX, "resumen_cerca": RESUMEN_CERCA, "cart_n": CARTELERA_N, "rsi_bajo": RSI_SOBREVENTA, "sel": {"rs": SEL_RS_MIN, "mv": SEL_MINERVINI_MIN, "score": SEL_SCORE_MIN}, "top_ruedas": TOP_RUEDAS, "top_n": TOP_N,
+                   "fuertes": ANCLAS_FUERTES, "exigir_rs": EXIGIR_RS, "castigo": SCORE_CASTIGO_BANDERA, "comp_rango": COMP_RANGO_ADR, "comp_deriva": COMP_DERIVA_ADR, "fuerte": CRECIMIENTO_FUERTE, "tc_min": TC_MIN_CIERRES, "tc_rango": TC_RANGO_MAX, "tc_cerca": TC_CERCA_PIVOT, "cruce_sem": CRUCE_SEMANAS, "rsi_alto": RSI_SOBRECOMPRA, "zona_compra": ZONA_COMPRA_MAX, "resumen_cerca": RESUMEN_CERCA, "cart_n": CARTELERA_N, "rsi_bajo": RSI_SOBREVENTA, "sel": {"rs": SEL_RS_MIN, "mv": SEL_MINERVINI_MIN, "score": SEL_SCORE_MIN}, "top_ruedas": TOP_RUEDAS, "top_n": TOP_N,
                    "pts": {"tend": PUNTOS_TENDENCIA, "rs": PUNTOS_RS, "contr": PUNTOS_COMPRESION, "setup": PUNTOS_SETUP, "fund": PUNTOS_FUNDAMENTALES}, "est10": ESTIRADA_EMA10_ADR, "est20": ESTIRADA_EMA20_ADR,
                    "foco_rs": FOCO_RS_MINIMO, "foco_riesgo": FOCO_RIESGO_MAX, "foco_max": FOCO_MAXIMO}},
         "foco": foco, "activos": sorted(activos, key=lambda a: -a["score"])}
@@ -2770,7 +2788,7 @@ function filasGatillos(tf){
     if(c && (c.es || c.ruptura)){
       const est = c.ruptura ? 'rompio' : (c.dist_gatillo!=null && c.dist_gatillo<=P.cerca_gatillo ? 'preparada' : 'comprimida');
       add(a, 'comp', 'Compresión'+(c.forma ? ' · '+c.forma : ''), est, est==='comprimida' ? 'Comprimida' : null,
-        `${c.emas ? '<span class="up">EMAs ↑</span>' : '<span class="mut">EMAs sin subir</span>'} <span class="mut">· vol ${fmt(c.vol_r,2)} · rango ${fmt(c.rango,1)}%</span>`,
+        `${c.desde ? `comprimida desde el ${esc(c.desde)} (${c.dias} ${tf==='d'?(c.dias===1?'rueda':'ruedas'):(c.dias===1?'semana':'semanas')})${c.ruptura?' y rompió hoy':''} · ` : ''}rango ${fmt(c.rango,1)}% (${fmt(c.rango_adr,1)} ADR) · vol ${fmt(c.vol_r,2)} · ${c.emas ? '<span class="up">EMAs ↑</span>' : 'EMAs sin subir'}`,
         c.gatillo, c.piso, c.dist_gatillo!=null ? -c.dist_gatillo : null); }
     // Inside day / week
     const i = a.inside && a.inside[tf];
@@ -2837,7 +2855,7 @@ function vGatillos(){
     <details class="ayuda"><summary>Cómo leer cada setup</summary>
       <p><b>VCP</b> (diario): contracciones cada vez más chicas, de la más vieja a la más nueva. Armada = última de ${fmt(P.vcp_ult,0)}% o menos, volumen seco y precio a ${fmt(P.vcp_dist,0)}% o menos del pivot. Recién rompió = cerró sobre el pivot con volumen de ${fmt(P.vol_ruptura,1)}x en las últimas ${P.vcp_dias} ruedas. TC = ${P.tc_min}+ cierres semanales seguidos dentro de ${fmt(P.tc_rango,1)}%.</p>
       <p><b>AVWAP</b>: rompiendo = cerró arriba con volumen de ${fmt(P.vol_ruptura,1)}x o más; por romper = hasta ${tf==='d'?P.dist_d:P.dist_w}% debajo de un ancla fuerte ★. Stop en el mínimo ${tf==='d'?'del día':'de la semana'}.</p>
-      <p><b>Compresión</b>: ATR y ancho de Bollinger bajos con volumen secándose. La forma sale de hacia dónde van los máximos y los mínimos en las últimas velas: triángulo (máximos bajan y mínimos suben), triángulo ascendente (techo plano, mínimos que suben), rango plano, bandera (los dos bajan después de una suba) o canal. Preparada = a ${P.cerca_gatillo}% o menos del gatillo (máximo reciente); stop en el piso del rango. Vos las operás con EMAs en ascenso: usá ese filtro.</p>
+      <p><b>Compresión</b>: ATR y ancho de Bollinger bajos con volumen secándose, y el precio de lado: rango de las últimas 10 velas de ${P.comp_rango} ADR o menos, sin una suba o caída de más de ${P.comp_deriva} ADR. "Comprimida desde" = desde qué vela se cumple todo eso. La forma sale de hacia dónde van los máximos y los mínimos en las últimas velas: triángulo (máximos bajan y mínimos suben), triángulo ascendente (techo plano, mínimos que suben), rango plano, bandera (los dos bajan después de una suba) o canal. Preparada = a ${P.cerca_gatillo}% o menos del gatillo (máximo reciente); stop en el piso del rango. Vos las operás con EMAs en ascenso: usá ese filtro.</p>
       <p><b>Inside</b>: vela dentro de la anterior; gatillo en el máximo de la vela madre y stop en su mínimo.</p>
       <p><b>Episodic pivot</b>: suba de ${fmt(P.ep_suba,0)}%+ con volumen ${fmt(P.ep_vol,1)}x en las últimas 10 ruedas. No siempre es para entrar ya: suele convenir esperar una consolidación.</p>
       <p><b>30 Min Pivot</b> (intradía): tocó una EMA diaria (${P.emas_30m.join(', ')}) y en 30 min la primera vela verde marca entrada (su máximo) y stop (su mínimo). Armado = no superó el máximo; disparado = lo superó en las últimas 3 horas.${D.meta.con30m ? '' : ' El intradía estaba desactivado en esta corrida.'}</p>
@@ -2890,7 +2908,7 @@ function ficha(t){
   const tvSym = a.tipo==='cripto' ? a.t.replace('-','') : a.t.replace('-','.');
   const avt = tf => (a.avwap[tf]||[]).length ? `<div class="tw"><table><thead><tr><th>Ancla</th><th class="n">AVWAP</th><th class="n">Dist.</th><th class="n">Vol.</th><th>Estado</th></tr></thead><tbody>${
       a.avwap[tf].map(x=>`<tr><td>${esc(x.ancla)}${x.fuerte?'<span class="fuerte">★</span>':''} <span class="mut">${esc(x.fecha)}</span></td><td class="n">${pr(x.valor)}</td><td class="n ${cls(x.dist)}">${pct(x.dist)}</td><td class="n">${x.vol_x!=null?fmt(x.vol_x,1)+'x':'–'}</td><td>${badge(x.estado)}${(x.estado==='rompe'||x.estado==='por romper')&&!x.cuenta?' <span class="mut" title="No cuenta: rompió sin volumen o ancla débil">no cuenta</span>':''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="vacio">Sin anclas.</p>';
-  const cmp = tf => a.comp[tf] ? `<span>Compresión ${TFN[tf]}</span><span>${fmt(a.comp[tf].score,0)}${a.comp[tf].es?' · comprimida':''}${a.comp[tf].forma?' · '+esc(a.comp[tf].forma):''}</span>` : '';
+  const cmp = tf => a.comp[tf] ? `<span>Compresión ${TFN[tf]}</span><span>${fmt(a.comp[tf].score,0)}${a.comp[tf].es?' · comprimida':''}${a.comp[tf].forma?' · '+esc(a.comp[tf].forma):''}${a.comp[tf].desde?' · desde el '+esc(a.comp[tf].desde)+' ('+a.comp[tf].dias+')':''}</span>` : '';
   const ins = tf => `<span>Inside ${tf==='d'?'day':'week'}</span><span>${a.inside[tf] && a.inside[tf].n ? a.inside[tf].n : 'no'}</span>`;
   $('#ficha').innerHTML = `
     <div class="fh"><div><h2>${esc(a.t)}<span class="rkg">#${D.activos.indexOf(a)+1} de ${D.activos.length}</span></h2><p>${esc(a.nombre)} · ${esc(a.sector)}${a.industria?' · '+esc(a.industria):''}</p></div><button class="cerrar" id="cerrar" aria-label="Cerrar ficha">✕</button></div>
