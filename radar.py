@@ -71,6 +71,14 @@ VCP_SEMANAS_MAX = 65
 VCP_TENDENCIA_PREVIA = 30
 VCP_DIAS_RUPTURA = 3
 VCP_DIAS_SEGUIMIENTO = 15
+VCP_ACHIQUE = 0.8             # cada contracción tiene que ser como mucho este múltiplo de la anterior (0,8 = 20% más chica)
+VCP_INICIO_EN_MAXIMO = 63     # el máximo donde arranca la base tiene que ser el más alto de las N ruedas previas (no una base a mitad de una caída)
+VCP_LEJOS_MAXIMO_52S = 15     # % máximo del pivot por debajo del máximo de 52 semanas
+VCP_VOL_DECRECIENTE = True    # el volumen de la última contracción tiene que ser menor que el de la primera
+VCP_CIERRES_ADR = 1.5         # "armada": los últimos 5 cierres dentro de este múltiplo del ADR (lado derecho quieto)
+VCP_SOBRE_EMA50 = True
+FORMA_VELAS_DIARIO = 25       # velas que se miran para clasificar la forma de una compresión (triángulo, rango plano, bandera)
+FORMA_VELAS_SEMANAL = 12        # "armada" y "formándose": precio sobre la EMA50
 # **Cierres semanales apretados (TC)**
 TC_MIN_CIERRES = 3      # cierres semanales consecutivos (completos) dentro del rango
 TC_RANGO_MAX = 1.5      # % entre el cierre más alto y el más bajo de esas semanas
@@ -883,6 +891,55 @@ def _norm(x):
     x = unicodedata.normalize("NFKD", str(x).strip().lower()).encode("ascii", "ignore").decode()
     return x.replace("maximo", "max").replace("minimo", "min").replace(".", "").replace(" ", "")
 
+def dia_exacto(dd, wk, nom, i, earn=None, ep_ts=None):
+    """Para un ancla semanal, el día exacto dentro de esa semana: el del máximo, el del mínimo, el de más volumen, etc."""
+    fin = wk.index[i]
+    ini = wk.index[i - 1] if i > 0 else dd.index[0] - pd.Timedelta(days=1)
+    sem = dd[(dd.index > ini) & (dd.index <= fin)]
+    if not len(sem): return None
+    if nom in ("Máx. estructural", "Máx. histórico"): f = sem.High.idxmax()
+    elif nom in ("Mín. estructural", "Mín. mensual", "Mín. histórico"): f = sem.Low.idxmin()
+    elif nom == "Alto volumen": f = sem.Volume.idxmax()
+    elif nom == "IPO": return 0
+    elif nom == "Earnings" and earn is not None:
+        j = int(dd.index.searchsorted(earn))
+        if j + 1 < len(dd) and dd.Volume.iloc[j + 1] > dd.Volume.iloc[j]: j += 1  # reporte después del cierre
+        return j if j < len(dd) else None
+    elif nom == "Episodic pivot" and ep_ts is not None:
+        j = int(dd.index.searchsorted(ep_ts)); return j if j < len(dd) else None
+    else: f = sem.index[0]
+    return dd.index.get_loc(f)
+
+def estado_avwap_sem(dd, wk, nom, i, j, regla):
+    """AVWAP semanal anclada en el día exacto j: se calcula con velas diarias (como en TradingView) y el estado se mide con cierres semanales."""
+    av_d = avwap_desde(dd, j)
+    if av_d.isna().all(): return None
+    av = av_d.resample(regla).last().reindex(wk.index[i:]).ffill()
+    c = wk.Close.iloc[i:]
+    if len(c) < 1 or not np.isfinite(av.iloc[-1]): return None
+    val, precio = av.iloc[-1], c.iloc[-1]
+    dist = (precio / val - 1) * 100
+    nb, tope = VELAS_RUPTURA_SEMANAL, DIST_POR_ROMPER_SEMANAL
+    previas_abajo = bool((c.iloc[-nb - 1:-1] <= av.iloc[-nb - 1:-1]).any()) if len(c) > 1 else False
+    vol_x = None
+    if dist > 0 and previas_abajo:
+        est = "rompe"
+        abajo = np.where(c.values[:-1] <= av.values[:-1])[0]
+        k = i + int(abajo[-1]) + 1 if len(abajo) else len(wk) - 1
+        prom = sma(wk.Volume, 20).shift(1).iloc[k]
+        vol_x = float(wk.Volume.iloc[k] / prom) if prom and prom > 0 else None
+    elif dist <= 0 and dist >= -tope: est = "por romper"
+    elif dist > 0: est = "arriba"
+    else: est = "abajo"
+    ini_sem = wk.index[-2] if len(wk) > 1 else wk.index[-1]
+    obj = dd.High.iloc[j:][dd.index[j:] <= ini_sem].max()
+    obj = obj if pd.notna(obj) and obj > precio else None
+    fuerte = nom in anclas_fuertes()
+    cuenta = (est == "rompe" and vol_x is not None and vol_x >= VOL_RUPTURA) or (est == "por romper" and fuerte)
+    return {"ancla": nom, "fecha": dd.index[j].strftime("%d-%m-%y"), "valor": num(val, 4), "dist": num(dist),
+            "estado": est, "objetivo": num(obj, 4), "vol_x": num(vol_x, 1) if vol_x is not None else None,
+            "fuerte": fuerte, "cuenta": bool(cuenta)}
+
 def anclas_fuertes():
     """Nombres de ancla (como los arma el motor) que figuran en ANCLAS_FUERTES, sin importar tildes ni puntos."""
     pedidas = {_norm(x) for x in str(ANCLAS_FUERTES).split(",") if x.strip()}
@@ -925,6 +982,24 @@ def emas_en_ascenso(df):
     if not ns or len(df) < max(ns) + 6: return False
     return all(ema(df.Close, n).iloc[-1] > ema(df.Close, n).iloc[-6] for n in ns)
 
+def forma_compresion(df, tf):
+    """Forma de la consolidación según hacia dónde van los máximos y los mínimos (rectas de regresión)."""
+    n = FORMA_VELAS_DIARIO if tf == "d" else FORMA_VELAS_SEMANAL
+    if len(df) < n + 25: return None
+    u = df.iloc[-n:]; x = np.arange(n); p = float(u.Close.iloc[-1])
+    dh = np.polyfit(x, u.High.values, 1)[0] * (n - 1) / p * 100   # cuánto cambió la recta de máximos en la ventana (%)
+    dl = np.polyfit(x, u.Low.values, 1)[0] * (n - 1) / p * 100
+    adr = adr_pct(df) if tf == "d" else adr_pct(df) * 2
+    thr = max(1.0, adr)                                             # menos de un ADR de pendiente = plano
+    sube_antes = p and df.Close.iloc[-n - 20] > 0 and (df.Close.iloc[-n] / df.Close.iloc[-n - 20] - 1) * 100 >= max(10, 2 * adr)
+    if dh < -thr and dl > thr: return "triángulo"
+    if abs(dh) <= thr and dl > thr: return "triángulo ascendente"
+    if dh < -thr and abs(dl) <= thr: return "triángulo descendente"
+    if abs(dh) <= thr and abs(dl) <= thr: return "rango plano"
+    if dh < -thr and dl < -thr: return "bandera" if sube_antes else "canal bajista"
+    if dh > thr and dl > thr: return "canal alcista"
+    return None
+
 def compresion(df, tf):
     m = _met_comp(df, tf)
     if m is None: return None
@@ -937,7 +1012,7 @@ def compresion(df, tf):
             "vol_r": num(m["vol_r"]), "rango": num(m["rango"], 1), "gatillo": num(gat, 4),
             "dist_gatillo": num((gat / df.Close.iloc[-1] - 1) * 100), "ruptura": ruptura, "vol_hoy": num(vol_hoy, 2),
             "piso": num(piso, 4), "riesgo": num((gat - piso) / gat * 100, 1) if gat > 0 else None,
-            "emas": emas_en_ascenso(df)}
+            "emas": emas_en_ascenso(df), "forma": forma_compresion(df, tf)}
 
 def inside(df):
     h, l = df.High.values, df.Low.values
@@ -1047,7 +1122,7 @@ def _depth(c): return (c["hi"] - c["lo"]) / c["hi"] * 100
 def _vcp_valida(contr):
     if len(contr) < VCP_MIN_CONTRACCIONES: return False
     d = [_depth(c) for c in contr]
-    if d[0] > VCP_PRIMERA_MAX or d[0] < VCP_PRIMERA_MIN or any(d[x + 1] >= d[x] for x in range(len(d) - 1)): return False
+    if d[0] > VCP_PRIMERA_MAX or d[0] < VCP_PRIMERA_MIN or any(d[x + 1] > d[x] * VCP_ACHIQUE for x in range(len(d) - 1)): return False
     # techos planos o bajando: si los máximos de las contracciones suben, es una cuña, no una VCP
     if any(contr[x + 1]["hi"] > contr[x]["hi"] * (1 + VCP_TOLERANCIA / 100) for x in range(len(contr) - 1)): return False
     # el pivot tiene que estar en la parte alta de la base, no en el medio del rango
@@ -1072,6 +1147,8 @@ def detectar_vcp(df):
         g = n - m + i0
         previo = df.Low.iloc[max(0, g - 126):g]
         if len(previo) < 40 or p0 / previo.min() - 1 < VCP_TENDENCIA_PREVIA / 100: continue
+        # la base arranca en un máximo de verdad: nada más alto en las ruedas previas
+        if VCP_INICIO_EN_MAXIMO and df.High.iloc[max(0, g - VCP_INICIO_EN_MAXIMO):g].max() > p0 * (1 + VCP_TOLERANCIA / 100): continue
         contr = _vcp_desde(j, piv, hi, lo)
         if not contr: continue
         # contracción chica en curso desde el último máximo (bandera final apretada)
@@ -1084,12 +1161,22 @@ def detectar_vcp(df):
                 if (h_p - lo[l_i]) / h_p * 100 >= 2:
                     contr = contr + [{"hi_i": h_i, "hi": h_p, "lo_i": l_i, "lo": lo[l_i]}]
         if not _vcp_valida(contr): continue
+        # el volumen se tiene que ir secando: menos en la última contracción que en la primera
+        if VCP_VOL_DECRECIENTE and len(contr) >= 2:
+            v1 = vo[contr[0]["hi_i"]:contr[0]["lo_i"] + 1].mean(); vn = vo[contr[-1]["hi_i"]:contr[-1]["lo_i"] + 1].mean()
+            if v1 > 0 and vn >= v1: continue
         if mejor is None or len(contr) > len(mejor[1]) or (len(contr) == len(mejor[1]) and i0 < mejor[0]):
             mejor = (i0, contr)
     if mejor is None: return None
     i0, contr = mejor
     ult = contr[-1]
     pivot, stop = ult["hi"], ult["lo"]
+    # cerca de máximos: el pivot no puede estar lejos del máximo de 52 semanas
+    hi52 = df.High.iloc[-252:].max()
+    if VCP_LEJOS_MAXIMO_52S and pivot < hi52 * (1 - VCP_LEJOS_MAXIMO_52S / 100): return None
+    e50 = ema(df.Close, 50)
+    sobre50 = (not VCP_SOBRE_EMA50) or df.Close.iloc[-1] > e50.iloc[-1]
+    quieto = (cl[-5:].max() / cl[-5:].min() - 1) * 100 <= VCP_CIERRES_ADR * max(adr, 0.5)
     vol50 = pd.Series(vo).rolling(50).mean().values
     # ruptura: el PRIMER cierre sobre el pivot después del mínimo de la última contracción (con o sin volumen).
     # El volumen de ruptura se mira en ese día y los 2 siguientes; si no aparece, es una ruptura sin volumen.
@@ -1117,7 +1204,9 @@ def detectar_vcp(df):
         if cl[-1] < stop: return None
         if cl[-1] > pivot and _depth(ult) <= VCP_FORMANDO_MAX:
             est = "sinvol"   # cerró sobre el pivot pero sin el volumen de ruptura
-        elif _depth(ult) <= VCP_ULTIMA_MAX and seco is not None and seco < VCP_VOL_SECO and dist <= VCP_DIST_PIVOT:
+        elif not sobre50:
+            return None
+        elif _depth(ult) <= VCP_ULTIMA_MAX and seco is not None and seco < VCP_VOL_SECO and dist <= VCP_DIST_PIVOT and quieto:
             est = "armada"
         elif _depth(ult) <= VCP_FORMANDO_MAX:
             est = "formandose"
@@ -1341,8 +1430,13 @@ def alertas_telegram(activos, fecha, resumen=None, regimen_ftd=None):
     """Manda por Telegram las Seleccionadas que hoy rompen su pivot VCP o su AVWAP con volumen (una vez por día y ticker)."""
     import os, requests
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-    if not ALERTAS_TELEGRAM or not token: return 0
-    chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not ALERTAS_TELEGRAM: return 0
+    if not token:
+        print("   ⚠️ Telegram: no encuentro el secreto TELEGRAM_TOKEN (Settings → Secrets and variables → Actions)"); return 0
+    try: env = json.load(open(ARCHIVO_ALERTAS))
+    except Exception: env = {}
+    # El chat se guarda la primera vez que se detecta: Telegram borra los mensajes pendientes del bot a las 24 horas
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or str(env.get("_chat_id", "") or "")
     api = f"https://api.telegram.org/bot{token}"
     try:
         if not chat:
@@ -1356,15 +1450,14 @@ def alertas_telegram(activos, fecha, resumen=None, regimen_ftd=None):
             chat = str(chats[-1]) if chats and chats[-1] else ""
         if not chat:
             print("   ⚠️ Telegram: mandale cualquier mensaje al bot para que sepa a qué chat escribir"); return 0
-        try: env = json.load(open(ARCHIVO_ALERTAS))
-        except Exception: env = {}
+        print(f"   Telegram: escribo al chat {chat}")
         conectado = env.get("_conectado")
-        env = {k: v for k, v in env.items() if v >= (dt.date.today() - dt.timedelta(days=7)).isoformat()}
+        env = {k: v for k, v in env.items() if k == "_chat_id" or str(v) >= (dt.date.today() - dt.timedelta(days=7)).isoformat()}
+        env["_chat_id"] = chat
         msgs = []
         if not conectado:
             # Primer uso: un mensaje de prueba para confirmar que el bot llega
             msgs.append(f"✅ <b>{NOMBRE_DASHBOARD}</b> conectado. Te aviso acá cuando una Seleccionada rompa su pivot VCP o una AVWAP con volumen.")
-        env["_conectado"] = "9999-12-31"
         for t, e in ((regimen_ftd or {}).items()):
             if e.get("estado") == "follow-through" and e.get("ftd") == fecha and f"_ftd:{t}:{fecha}" not in env:
                 msgs.append(f"🟢 <b>Follow-through day en {t}</b>: +{e['suba']:.2f}% con más volumen, día {e['ftd_dia']} del rally. "
@@ -1389,7 +1482,7 @@ def alertas_telegram(activos, fecha, resumen=None, regimen_ftd=None):
         for m in msgs:
             r = requests.post(api + "/sendMessage", timeout=20, data={"chat_id": chat, "parse_mode": "HTML", "disable_web_page_preview": "true",
                                                                      "text": m + f"\n<a href=\"{URL_DASHBOARD}\">Abrir dashboard</a>"}).json()
-            if r.get("ok"): enviados += 1
+            if r.get("ok"): enviados += 1; env["_conectado"] = "9999-12-31"
             else: print(f"   ⚠️ Telegram no mandó el mensaje: {r.get('description')}")
         if enviados or not msgs: json.dump(env, open(ARCHIVO_ALERTAS, "w"))
         return enviados
@@ -1640,9 +1733,16 @@ def correr():
         ep = episodic(df)
         earn_dias = (prox.normalize() - hoy.normalize()).days if prox is not None else None
         av = {}
-        for tf, d in (("d", df), ("w", wk)):
-            lst = [estado_avwap(d, nom, i, tf) for nom, i in anclas(d, tf, earn, es_ipo, ep["_ts"] if ep else None)]
-            av[tf] = [x for x in lst if x]
+        ep_ts = ep["_ts"] if ep else None
+        av["d"] = [x for x in (estado_avwap(df, nom, i, "d") for nom, i in anclas(df, "d", earn, es_ipo, ep_ts)) if x]
+        # Semanal: la vela semanal elige el ancla, pero se ancla en el día exacto (no en el viernes de esa semana)
+        av["w"], vistos_w = [], set()
+        for nom, i in anclas(wk, "w", earn, es_ipo, ep_ts):
+            j = dia_exacto(df, wk, nom, i, earn, ep_ts)
+            if j is None or j in vistos_w or j >= len(df) - 1: continue
+            vistos_w.add(j)
+            x = estado_avwap_sem(df, wk, nom, i, j, "W-SUN" if tipo == "cripto" else "W-FRI")
+            if x: av["w"].append(x)
         activo_av = any(x["cuenta"] for tf in av for x in av[tf])
         vcp = detectar_vcp(df)
         tc = cierres_apretados(df, wk, vcp)
@@ -2097,6 +2197,21 @@ details.ayuda{margin-top:14px;color:var(--muted);font-size:13.5px;max-width:85ch
 details.ayuda summary{cursor:pointer;color:var(--acc);font-weight:700;margin-bottom:6px}
 details.ayuda p{margin:8px 0}
 main{min-width:0;overflow-x:clip}
+.gacc{display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px 18px;padding:14px 14px;border-radius:12px;border:1px solid var(--line);
+  background:color-mix(in srgb,var(--text) 2.5%,var(--card));margin-bottom:10px;cursor:pointer}
+.gacc:hover{border-color:color-mix(in srgb,var(--acc) 45%,var(--line))}
+.gtk .gt{font-size:22px;font-weight:800;letter-spacing:-.01em;line-height:1.05;word-break:break-all}
+.gtk .gsc{margin-top:6px;font-size:12.5px;color:var(--muted)}.gtk .gsc b{color:var(--text);font-size:14px}
+.gtk .gbd{margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.gtk .gbd .selb{margin-left:0}
+.gset{padding:0 0 10px;margin-bottom:10px;border-bottom:1px dashed var(--line2)}
+.gset:last-of-type{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.gs1{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.gsn{font-weight:700;font-size:14.5px}
+.gs2{display:flex;gap:4px 16px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-top:5px;font-variant-numeric:tabular-nums}
+.gs2 b{color:var(--text);font-weight:600}.gs2 b.up{color:var(--up)}.gs2 b.down{color:var(--down)}.gs2 b.warn{color:var(--warn)}
+.gs3{font-size:12px;color:var(--faint);margin-top:3px}.gs3 .mut{color:var(--faint)}
+.gtamb{font-size:12px;color:var(--faint);margin-top:8px}
+@media (max-width:600px){.gacc{grid-template-columns:1fr;gap:10px}.gtk{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.gtk .gsc,.gtk .gbd{margin:0}}
 .gl{display:flex;flex-direction:column}
 .gr{padding:11px 2px;border-top:1px solid var(--line);cursor:pointer}
 .gr:first-child{border-top:0}
@@ -2654,7 +2769,7 @@ function filasGatillos(tf){
     const c = a.comp && a.comp[tf];
     if(c && (c.es || c.ruptura)){
       const est = c.ruptura ? 'rompio' : (c.dist_gatillo!=null && c.dist_gatillo<=P.cerca_gatillo ? 'preparada' : 'comprimida');
-      add(a, 'comp', 'Compresión', est, est==='comprimida' ? 'Comprimida' : null,
+      add(a, 'comp', 'Compresión'+(c.forma ? ' · '+c.forma : ''), est, est==='comprimida' ? 'Comprimida' : null,
         `${c.emas ? '<span class="up">EMAs ↑</span>' : '<span class="mut">EMAs sin subir</span>'} <span class="mut">· vol ${fmt(c.vol_r,2)} · rango ${fmt(c.rango,1)}%</span>`,
         c.gatillo, c.piso, c.dist_gatillo!=null ? -c.dist_gatillo : null); }
     // Inside day / week
@@ -2672,6 +2787,24 @@ function filasGatillos(tf){
   });
   return out;
 }
+// Una tarjeta por acción: ticker grande a la izquierda y sus setups adentro
+function gruposGatillos(l, base, cols){
+  if(!l.length) return `<p class="vacio">${S.gListos ? 'Nada listo para disparar con estos filtros. Probá sacando “Solo listos”.' : 'Ningún gatillo con estos filtros.'}</p>`;
+  const G = new Map();
+  l.forEach(r => { if(!G.has(r.a.t)) G.set(r.a.t, {a:r.a, s:[]}); G.get(r.a.t).s.push(r); });
+  const setup = r => `<div class="gset"><div class="gs1"><span class="gsn">${esc(r.nombre)}</span>${cols[2].f(r)}</div>
+    <div class="gs2"><span>Entrada <b>${pr(r.e)}</b></span><span>Stop <b>${pr(r.st)}</b></span><span>Riesgo ${r.r!=null?`<b class="${r.r>P.foco_riesgo?'warn':''}">${fmt(r.r,1)}%</b>`:'<b>–</b>'}</span><span>vs. entrada ${r.d!=null?`<b class="${cls(r.d)}">${pct(r.d,1)}</b>`:'<b>–</b>'}</span></div>
+    ${r.det?`<div class="gs3">${r.det}</div>`:''}</div>`;
+  return [...G.values()].map(g => {
+    const otros = S.gTipo ? base.filter(r => r.a.t===g.a.t && r.tipo!==S.gTipo) : [];
+    const est = r => r.badgeTxt || ((EST[r.est]||[])[1] || r.est);
+    return `<div class="gacc" data-t="${esc(g.a.t)}" tabindex="0">
+      <div class="gtk"><div class="gt">${esc(g.a.t)}</div><div class="gsc">Score <b>${fmt(g.a.score,0)}</b></div>
+        <div class="gbd">${selB(g.a)}${canslim(g.a)}${earnB(g.a)}${flags(g.a)}${sinAv(g.a)}</div></div>
+      <div class="gsets">${g.s.map(setup).join('')}
+        ${otros.length ? `<div class="gtamb">también: ${otros.map(r=>esc(r.nombre)+' '+esc(est(r).toLowerCase())).join(' · ')}</div>` : ''}</div></div>`;
+  }).join('');
+}
 function vGatillos(){
   const tf = S.tf, todas = filasGatillos(tf);
   const pasa = r => (!S.gListos || LISTOS.has(r.est)) && (!S.gSel || esSelA(r.a)) && (!S.gEmas || (r.a.comp[tf] && r.a.comp[tf].emas))
@@ -2679,7 +2812,7 @@ function vGatillos(){
   const base = todas.filter(pasa);
   const l = base.filter(r => !S.gTipo || r.tipo===S.gTipo)
     .sort((x,y) => ((PRIO[x.est]??9)-(PRIO[y.est]??9)) || (y.a.score-x.a.score));
-  const cnt = k => base.filter(r => !k || r.tipo===k).length;
+  const cnt = k => new Set(base.filter(r => !k || r.tipo===k).map(r => r.a.t)).size;
   const cols = [
     {h:'Ticker', f:r=>tk(r.a)+selB(r.a)+sinAv(r.a)},
     {h:'Setup', f:r=>`<b>${esc(r.nombre)}</b>`},
@@ -2700,11 +2833,11 @@ function vGatillos(){
       ${chip('data-gf','rsiF','RSI semanal cruzó al alza', !!S.rsiF)}
       ${chip('data-gf','macdF','MACD semanal alcista', !!S.macdF)}
     </div>
-    ${card('Gatillos · '+TFN[tf], l.length, filasLista(l.map(r=>({a:r.a, extra:selB(r.a)+sinAv(r.a), setup:esc(r.nombre), est:cols[2].f(r), e:r.e, st:r.st, r:r.r, d:r.d, det:r.det})), S.gListos ? 'Nada listo para disparar con estos filtros. Probá sacando “Solo listos”.' : 'Ningún gatillo con estos filtros.'))}
+    ${card('Gatillos · '+TFN[tf], `${cnt(S.gTipo||'')} acciones · ${l.length} setups`, gruposGatillos(l, base, cols))}
     <details class="ayuda"><summary>Cómo leer cada setup</summary>
       <p><b>VCP</b> (diario): contracciones cada vez más chicas, de la más vieja a la más nueva. Armada = última de ${fmt(P.vcp_ult,0)}% o menos, volumen seco y precio a ${fmt(P.vcp_dist,0)}% o menos del pivot. Recién rompió = cerró sobre el pivot con volumen de ${fmt(P.vol_ruptura,1)}x en las últimas ${P.vcp_dias} ruedas. TC = ${P.tc_min}+ cierres semanales seguidos dentro de ${fmt(P.tc_rango,1)}%.</p>
       <p><b>AVWAP</b>: rompiendo = cerró arriba con volumen de ${fmt(P.vol_ruptura,1)}x o más; por romper = hasta ${tf==='d'?P.dist_d:P.dist_w}% debajo de un ancla fuerte ★. Stop en el mínimo ${tf==='d'?'del día':'de la semana'}.</p>
-      <p><b>Compresión</b>: ATR y ancho de Bollinger bajos con volumen secándose. Preparada = a ${P.cerca_gatillo}% o menos del gatillo (máximo reciente); stop en el piso del rango. Vos las operás con EMAs en ascenso: usá ese filtro.</p>
+      <p><b>Compresión</b>: ATR y ancho de Bollinger bajos con volumen secándose. La forma sale de hacia dónde van los máximos y los mínimos en las últimas velas: triángulo (máximos bajan y mínimos suben), triángulo ascendente (techo plano, mínimos que suben), rango plano, bandera (los dos bajan después de una suba) o canal. Preparada = a ${P.cerca_gatillo}% o menos del gatillo (máximo reciente); stop en el piso del rango. Vos las operás con EMAs en ascenso: usá ese filtro.</p>
       <p><b>Inside</b>: vela dentro de la anterior; gatillo en el máximo de la vela madre y stop en su mínimo.</p>
       <p><b>Episodic pivot</b>: suba de ${fmt(P.ep_suba,0)}%+ con volumen ${fmt(P.ep_vol,1)}x en las últimas 10 ruedas. No siempre es para entrar ya: suele convenir esperar una consolidación.</p>
       <p><b>30 Min Pivot</b> (intradía): tocó una EMA diaria (${P.emas_30m.join(', ')}) y en 30 min la primera vela verde marca entrada (su máximo) y stop (su mínimo). Armado = no superó el máximo; disparado = lo superó en las últimas 3 horas.${D.meta.con30m ? '' : ' El intradía estaba desactivado en esta corrida.'}</p>
@@ -2757,7 +2890,7 @@ function ficha(t){
   const tvSym = a.tipo==='cripto' ? a.t.replace('-','') : a.t.replace('-','.');
   const avt = tf => (a.avwap[tf]||[]).length ? `<div class="tw"><table><thead><tr><th>Ancla</th><th class="n">AVWAP</th><th class="n">Dist.</th><th class="n">Vol.</th><th>Estado</th></tr></thead><tbody>${
       a.avwap[tf].map(x=>`<tr><td>${esc(x.ancla)}${x.fuerte?'<span class="fuerte">★</span>':''} <span class="mut">${esc(x.fecha)}</span></td><td class="n">${pr(x.valor)}</td><td class="n ${cls(x.dist)}">${pct(x.dist)}</td><td class="n">${x.vol_x!=null?fmt(x.vol_x,1)+'x':'–'}</td><td>${badge(x.estado)}${(x.estado==='rompe'||x.estado==='por romper')&&!x.cuenta?' <span class="mut" title="No cuenta: rompió sin volumen o ancla débil">no cuenta</span>':''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="vacio">Sin anclas.</p>';
-  const cmp = tf => a.comp[tf] ? `<span>Compresión ${TFN[tf]}</span><span>${fmt(a.comp[tf].score,0)}${a.comp[tf].es?' · comprimida':''}</span>` : '';
+  const cmp = tf => a.comp[tf] ? `<span>Compresión ${TFN[tf]}</span><span>${fmt(a.comp[tf].score,0)}${a.comp[tf].es?' · comprimida':''}${a.comp[tf].forma?' · '+esc(a.comp[tf].forma):''}</span>` : '';
   const ins = tf => `<span>Inside ${tf==='d'?'day':'week'}</span><span>${a.inside[tf] && a.inside[tf].n ? a.inside[tf].n : 'no'}</span>`;
   $('#ficha').innerHTML = `
     <div class="fh"><div><h2>${esc(a.t)}<span class="rkg">#${D.activos.indexOf(a)+1} de ${D.activos.length}</span></h2><p>${esc(a.nombre)} · ${esc(a.sector)}${a.industria?' · '+esc(a.industria):''}</p></div><button class="cerrar" id="cerrar" aria-label="Cerrar ficha">✕</button></div>
