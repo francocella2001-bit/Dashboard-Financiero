@@ -24,6 +24,7 @@ VELAS_RUPTURA_SEMANAL = 2
 BUSCAR_EARNINGS = True
 # **Compresión e intradía**
 VOL_RUPTURA = 1.3
+VOL_MEDIANA = True  # True: el volumen de ruptura se compara contra la mediana de 50 ruedas (los días gigantes de earnings no la inflan); False: contra el promedio
 CERCA_GATILLO = 2.0
 ANALIZAR_30M = True
 EMAS_DIARIO_PIVOT = "8, 10, 20, 50"
@@ -533,6 +534,9 @@ def fundamentales(tickers, ultimo_reporte):
 # ---------------------------------------------------------------- indicadores
 def sma(s, n): return s.rolling(n).mean()
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def vol_normal(v, n=50):
+    """Volumen "normal" contra el que se mide una ruptura: la mediana (o el promedio) de las últimas n velas."""
+    return v.rolling(n).median() if VOL_MEDIANA else v.rolling(n).mean()
 def atr(df, n):
     pc = df.Close.shift()
     tr = pd.concat([df.High - df.Low, (df.High - pc).abs(), (df.Low - pc).abs()], axis=1).max(axis=1)
@@ -680,7 +684,7 @@ def banderas(df, sav_d, earn_dias):
     c, h, l = df.Close.iloc[-1], df.High.iloc[-1], df.Low.iloc[-1]
     prev = df.iloc[:-1]
     hi_prev = prev[prev.index >= df.index[-1] - pd.Timedelta(days=365)].High.max()
-    prom = sma(df.Volume, 50).iloc[-2]
+    prom = vol_normal(df.Volume, 50).iloc[-2]
     vol_x = df.Volume.iloc[-1] / prom if prom > 0 else 1
     rng = h - l
     if rng > 0 and h >= hi_prev * 0.98 and (h - c) / rng >= 0.6:
@@ -689,7 +693,7 @@ def banderas(df, sav_d, earn_dias):
         f.append({"k": "maxvol", "c": "máx. + vol", "t": f"Rompió el máximo de 52 semanas con {vol_x:.1f}x de volumen", "tipo": "good"})
     rompe_hoy = c > df.High.iloc[-21:-1].max()
     if (rompe_hoy or (sav_d and sav_d["estado"] == "rompe")) and vol_x < 1.0:
-        f.append({"k": "sinvol", "c": "sin volumen", "t": f"Ruptura con volumen bajo ({vol_x:.1f}x el promedio)", "tipo": "bad"})
+        f.append({"k": "sinvol", "c": "sin volumen", "t": f"Ruptura con volumen bajo ({vol_x:.1f}x su volumen normal de 50 ruedas)", "tipo": "bad"})
     s50 = sma(df.Close, 50).iloc[-1]
     if s50 > 0 and c / s50 - 1 > EXTENDIDO_SMA50 / 100:
         f.append({"k": "ext", "c": "extendido", "t": f"Extendido: {(c / s50 - 1) * 100:.0f}% sobre la SMA50", "tipo": "warn"})
@@ -875,7 +879,7 @@ def estado_avwap(df, nom, i, tf):
         # vela de la ruptura: la primera que cerró arriba después del último cierre debajo
         abajo = np.where((c.values[:-1] <= av.values[:-1]))[0]
         k = i + int(abajo[-1]) + 1 if len(abajo) else len(df) - 1
-        prom = sma(df.Volume, 50 if tf == "d" else 20).shift(1).iloc[k]
+        prom = vol_normal(df.Volume, 50 if tf == "d" else 20).shift(1).iloc[k]
         vol_x = float(df.Volume.iloc[k] / prom) if prom and prom > 0 else None
     elif dist <= 0 and dist >= -tope: est = "por romper"
     elif dist > 0: est = "arriba"
@@ -928,7 +932,7 @@ def estado_avwap_sem(dd, wk, nom, i, j, regla):
         est = "rompe"
         abajo = np.where(c.values[:-1] <= av.values[:-1])[0]
         k = i + int(abajo[-1]) + 1 if len(abajo) else len(wk) - 1
-        prom = sma(wk.Volume, 20).shift(1).iloc[k]
+        prom = vol_normal(wk.Volume, 20).shift(1).iloc[k]
         vol_x = float(wk.Volume.iloc[k] / prom) if prom and prom > 0 else None
     elif dist <= 0 and dist >= -tope: est = "por romper"
     elif dist > 0: est = "arriba"
@@ -1010,7 +1014,8 @@ def compresion(df, tf):
     m = _met_comp(df, tf)
     if m is None: return None
     ant = _met_comp(df.iloc[:-1], tf)
-    vol_hoy = df.Volume.iloc[-1] / sma(df.Volume, m["vl"]).iloc[-2] if sma(df.Volume, m["vl"]).iloc[-2] > 0 else 0
+    vn = vol_normal(df.Volume, m["vl"]).iloc[-2]
+    vol_hoy = df.Volume.iloc[-1] / vn if vn > 0 else 0
     ruptura = bool(ant and ant["es"] and df.Close.iloc[-1] > ant["gatillo"] and vol_hoy >= VOL_RUPTURA)
     gat = ant["gatillo"] if ruptura else m["gatillo"]
     piso = ant["piso"] if ruptura else m["piso"]
@@ -1196,12 +1201,13 @@ def detectar_vcp(df):
     sobre50 = (not VCP_SOBRE_EMA50) or df.Close.iloc[-1] > e50.iloc[-1]
     quieto = (cl[-5:].max() / cl[-5:].min() - 1) * 100 <= VCP_CIERRES_ADR * max(adr, 0.5)
     vol50 = pd.Series(vo).rolling(50).mean().values
+    vrup = vol_normal(pd.Series(vo), 50).values   # referencia para el volumen de ruptura
     # ruptura: el PRIMER cierre sobre el pivot después del mínimo de la última contracción (con o sin volumen).
     # El volumen de ruptura se mira en ese día y los 2 siguientes; si no aparece, es una ruptura sin volumen.
     b = next((x for x in range(ult["lo_i"] + 1, m) if cl[x] > pivot), None)
     sin_vol_rup = False
     if b is not None:
-        vx = [vo[x] / vol50[x - 1] for x in range(b, min(m, b + 3)) if vol50[x - 1]]
+        vx = [vo[x] / vrup[x - 1] for x in range(b, min(m, b + 3)) if vrup[x - 1]]
         sin_vol_rup = not vx or max(vx) < VOL_RUPTURA
     # secado de volumen: promedio desde el inicio de la última contracción vs. promedio de 50 ruedas previo
     fin_c = (b - 1) if b is not None else m - 1
@@ -1210,7 +1216,7 @@ def detectar_vcp(df):
     dias = vol_b = None
     if b is not None:
         dias = m - 1 - b
-        vx = [float(vo[x] / vol50[x - 1]) for x in range(b, min(m, b + 3)) if vol50[x - 1]]
+        vx = [float(vo[x] / vrup[x - 1]) for x in range(b, min(m, b + 3)) if vrup[x - 1]]
         vol_b = max(vx) if vx else None
         if dias > VCP_DIAS_SEGUIMIENTO: return None
         if any(cl[x] < pivot for x in range(b + 1, m)): est = "fallo"
@@ -1702,17 +1708,24 @@ def correr():
     es_acc = lambda t: info.at[t, "tipo"] == "accion"
     paso = [t for t in diario if t in rs_pct.index]
     embudo = [("Con datos", len(paso))]
-    paso = [t for t in paso if info.at[t, "tipo"] == "cripto" or diario[t].Close.iloc[-1] >= PRECIO_MINIMO]
+    # Para el buscador: en qué filtro quedó afuera cada acción ("p" precio, "l" liquidez, "m" market cap, "a" ADR, "v5:2,3" Minervini 5/8 y qué criterios fallan)
+    fuera = {t: "d" for t in uni.ticker if t not in paso}
+    def _saco(antes, despues, cod):
+        quedan = set(despues)
+        for t in antes:
+            if t not in quedan: fuera[t] = cod
+        return despues
+    paso = _saco(paso, [t for t in paso if info.at[t, "tipo"] == "cripto" or diario[t].Close.iloc[-1] >= PRECIO_MINIMO], "p")
     embudo.append((f"Precio ≥ {PRECIO_MINIMO}", len(paso)))
     liq = {}
     for t in paso:
         if es_acc(t): liq[t] = liquida(diario[t])
-    paso = [t for t in paso if not es_acc(t) or liq[t][0]]
+    paso = _saco(paso, [t for t in paso if not es_acc(t) or liq[t][0]], "l")
     embudo.append(("Liquidez", len(paso)))
     perf = perfiles([t for t in paso if es_acc(t)], {t: float(diario[t].Close.iloc[-1]) for t in paso})
     if MARKET_CAP_MIN > 0:
         # Sin dato de market cap no se descarta (se muestra s/d)
-        paso = [t for t in paso if not es_acc(t) or not (perf.get(t) or {}).get("mcap") or perf[t]["mcap"] >= MARKET_CAP_MIN]
+        paso = _saco(paso, [t for t in paso if not es_acc(t) or not (perf.get(t) or {}).get("mcap") or perf[t]["mcap"] >= MARKET_CAP_MIN], "m")
         embudo.append((f"Market cap ≥ {MARKET_CAP_MIN / 1e9:g} B", len(paso)))
     print("   Régimen de mercado…")
     extra = descargar(["SPY", "QQQ", "^VIX"], "2y", "1d")
@@ -1720,7 +1733,7 @@ def correr():
     reg = regimen({t: diario.get(t, extra.get(t)) for t in ("SPY", "QQQ")}, extra.get("^VIX"),
                   [diario[t] for t in paso if es_acc(t)])
     liquidas = [t for t in paso if es_acc(t)]
-    paso = [t for t in paso if adr_pct(diario[t]) >= (ADR_MINIMO_ETF if info.at[t, "tipo"] == "etf" else ADR_MINIMO)]
+    paso = _saco(paso, [t for t in paso if adr_pct(diario[t]) >= (ADR_MINIMO_ETF if info.at[t, "tipo"] == "etf" else ADR_MINIMO)], "a")
     embudo.append((f"ADR ≥ {ADR_MINIMO:g}%", len(paso)))
     spy = diario.get("SPY")
     if spy is None: spy = extra.get("SPY")
@@ -1730,6 +1743,8 @@ def correr():
         checks, hi, lo, _ = minervini(diario[t], spy_c, info.at[t, "tipo"] == "etf")
         if pasa_minervini(checks, rs_pct[t]):
             cand[t] = True
+        else:
+            fuera[t] = f"v{sum(checks)}:" + ",".join(str(k + 1) for k, ok in enumerate(checks) if not ok)
     embudo.append((f"Minervini {MIN_CRITERIOS_MINERVINI}/8", len(cand)))
     print("   " + " → ".join(f"{n} {k}" for k, n in embudo))
     print("4/5 Historia completa, earnings y AVWAP de los candidatos…")
@@ -1743,7 +1758,8 @@ def correr():
         if df is None or len(df) < len(diario[t]): df = diario[t]
         # Con la historia completa las EMA150/200 quedan iguales a las de TradingView; se vuelve a chequear el X/8
         checks, hi, lo, e = minervini(df, spy_c, tipo == "etf")
-        if not pasa_minervini(checks, rs_pct[t]): continue
+        if not pasa_minervini(checks, rs_pct[t]):
+            fuera[t] = f"v{sum(checks)}:" + ",".join(str(k + 1) for k, ok in enumerate(checks) if not ok); continue
         wk = semanal(df, tipo == "cripto")
         dfs_d[t] = df
         earn, prox = (fechas_earnings(t) if (BUSCAR_EARNINGS and tipo == "accion") else (None, None))
@@ -1859,7 +1875,7 @@ def correr():
     fechas = [df.index[-1] for t, df in diario.items() if info.at[t, "tipo"] != "cripto"] or [hoy]
     datos = {"meta": {
         "fecha_datos": max(fechas).strftime("%d-%m-%Y"), "generado": ahora_ar().strftime("%d-%m-%Y %H:%M"),
-        "n_universo": len(diario), "top": top, "selh": selh, "macro": macro, "earn_cal": earn_cal, "cartelera": cart, "rotacion": rot, "nombre": NOMBRE_DASHBOARD, "lema": LEMA, "avatar": AVATAR_URL, "embudo": [[k, n] for k, n in embudo], "n_extra": sum(1 for a in activos if a["sin_av"]), "con30m": con30, "regimen": reg, "demo": bool(globals().get("MODO_DEMO", False)),
+        "n_universo": len(diario), "top": top, "selh": selh, "macro": macro, "earn_cal": earn_cal, "cartelera": cart, "rotacion": rot, "nombre": NOMBRE_DASHBOARD, "lema": LEMA, "avatar": AVATAR_URL, "embudo": [[k, n] for k, n in embudo], "fuera": {t: c for t, c in fuera.items() if t not in {a["t"] for a in activos}}, "n_extra": sum(1 for a in activos if a["sin_av"]), "con30m": con30, "regimen": reg, "demo": bool(globals().get("MODO_DEMO", False)),
         "params": {"min_mv": MIN_CRITERIOS_MINERVINI, "sobre_min": PCT_SOBRE_MINIMO_52S, "sobre_min_etf": PCT_SOBRE_MINIMO_52S_ETF, "bajo_max": PCT_DEBAJO_MAXIMO_52S,
                    "rs_min": RS_MINIMO, "precio_min": PRECIO_MINIMO, "exigir_av": EXIGIR_AVWAP,
                    "dist_d": DIST_POR_ROMPER_DIARIO, "dist_w": DIST_POR_ROMPER_SEMANAL,
@@ -2215,6 +2231,14 @@ details.ayuda{margin-top:14px;color:var(--muted);font-size:13.5px;max-width:85ch
 details.ayuda summary{cursor:pointer;color:var(--acc);font-weight:700;margin-bottom:6px}
 details.ayuda p{margin:8px 0}
 main{min-width:0;overflow-x:clip}
+.busq{margin-bottom:18px;cursor:pointer;border-color:color-mix(in srgb,var(--acc) 45%,var(--line))}
+.busq.no{cursor:default;border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+.busq .bq1{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.busq .gt{font-size:22px;font-weight:800}
+.busq .ver{margin-left:auto;color:var(--acc);font-weight:700;font-size:13px}
+.busq .bq2{display:flex;gap:6px 18px;flex-wrap:wrap;font-size:13.5px;color:var(--muted);margin-top:8px;align-items:center}.busq .bq2 b{color:var(--text)}
+.busq .bq3{font-size:13.5px;margin-top:8px;color:var(--muted);line-height:1.5}.busq .bq3 b{color:var(--text)}
+.lset{font-size:11.5px;font-weight:700;border-radius:999px;padding:1px 8px;background:color-mix(in srgb,var(--text) 7%,transparent);color:var(--muted);white-space:nowrap}
+.lset.ok{background:var(--accsoft);color:var(--acc)}
 .gacc{display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px 18px;padding:14px 14px;border-radius:12px;border:1px solid var(--line);
   background:color-mix(in srgb,var(--text) 2.5%,var(--card));margin-bottom:10px;cursor:pointer}
 .gacc:hover{border-color:color-mix(in srgb,var(--acc) 45%,var(--line))}
@@ -2657,9 +2681,31 @@ function vInicio(){
   return `${regMini(R)}${B.dosH}
     <h2 class="sec">Próximas ruedas <small>macro de impacto y earnings · hora Argentina</small></h2>${eventosSemana(2)}`;
 }
+function lideresHTML(){
+  const SL = P.sel || {rs:80, mv:7, score:70};
+  const setups = {};
+  filasGatillos('d').forEach(r => (setups[r.a.t] = setups[r.a.t] || []).push(r));
+  const l = visibles(true).filter(a => a.rs>=SL.rs && a.mv>=SL.mv).sort((x,y) => y.rs-x.rs || y.score-x.score);
+  const cols = [
+    {h:'', f:r=>`<span class="rk">${r.i+1}</span>`},
+    {h:'Ticker', f:r=>tk(r.a)+selB(r.a)},
+    TEND,
+    {h:'3 meses', f:r=>spark(r.a.spark_d)},
+    {h:'RS', n:1, f:r=>`<b>${fmt(r.a.rs,0)}</b>`},
+    {h:'Score', n:1, f:r=>`<span class="scp">${fmt(r.a.score,0)}</span>`},
+    {h:'Desde el máx. 52s', n:1, f:r=>`<span class="${cls(r.a.off_hi)}">${pct(r.a.off_hi,1)}</span>`},
+    {h:'ADR', n:1, f:r=>adrC(r.a.adr)},
+    {h:'Setups hoy', f:r=>{ const x = setups[r.a.t]||[]; return x.length ? x.map(z=>`<span class="lset ${LISTOS.has(z.est)?'ok':''}">${esc(z.nombre.replace('Compresión · ','Compr. '))}</span>`).join(' ') : '<span class="mut">ninguno</span>'; }},
+  ];
+  const n = S.lidMas ? l.length : 30;
+  return `<div class="foco">${card('Líderes', `${l.length} · RS ${SL.rs}+ y ${SL.mv}/8 o más, sin importar el score · ordenadas por RS`,
+    `<p class="nota" style="margin:0 0 10px">Las más fuertes del radar, tengan o no un setup hoy. Sirve para seguirlas y esperar su gatillo. Las que además tienen score ${SL.score}+ son Seleccionadas (SEL).</p>`
+    + tabla(cols, l.slice(0, n).map((a,i)=>({a,i})), 'Ninguna cumple RS y tendencia hoy.')
+    + (l.length > 30 ? `<button class="chip" data-lidmas="1" style="margin-top:10px">${S.lidMas ? 'Ver menos' : 'Ver las '+(l.length-30)+' restantes'}</button>` : ''))}</div>`;
+}
 function vRanking(){
   const B = bloques();
-  return `${B.selH}${B.topH}${B.trackH}<div class="grid g2" style="margin-bottom:18px">${B.nuevos}${B.topOpt || ''}</div>${B.emb}`;
+  return `${B.selH}${lideresHTML()}${B.topH}${B.trackH}<div class="grid g2" style="margin-bottom:18px">${B.nuevos}${B.topOpt || ''}</div>${B.emb}`;
 }
 function vMercado(){
   const B = bloques();
@@ -2859,6 +2905,7 @@ function vGatillos(){
       <p><b>Inside</b>: vela dentro de la anterior; gatillo en el máximo de la vela madre y stop en su mínimo.</p>
       <p><b>Episodic pivot</b>: suba de ${fmt(P.ep_suba,0)}%+ con volumen ${fmt(P.ep_vol,1)}x en las últimas 10 ruedas. No siempre es para entrar ya: suele convenir esperar una consolidación.</p>
       <p><b>30 Min Pivot</b> (intradía): tocó una EMA diaria (${P.emas_30m.join(', ')}) y en 30 min la primera vela verde marca entrada (su máximo) y stop (su mínimo). Armado = no superó el máximo; disparado = lo superó en las últimas 3 horas.${D.meta.con30m ? '' : ' El intradía estaba desactivado en esta corrida.'}</p>
+      <p><b>Volumen de ruptura</b>: se compara contra el volumen normal de la acción, la mediana de las últimas 50 ruedas (20 semanas en semanal), así los días gigantes de earnings no inflan la vara.</p>
       <p><b>SEL</b> = Seleccionada (RS ${(P.sel||{}).rs||80}+, ${(P.sel||{}).mv||7}/8+, score ${(P.sel||{}).score||70}+). <b>Solo listos</b> deja lo que ya disparó o está a punto.</p>
     </details>`;
 }
@@ -2980,13 +3027,42 @@ function ir(p){
   S.pag = p; document.querySelectorAll('#rail button').forEach(b=>b.setAttribute('aria-current', b.dataset.pag===p ? 'page' : 'false'));
   render(); window.scrollTo(0,0);
 }
+// Si lo que se escribió es un ticker exacto: dónde está en el radar o por qué no entra
+function buscarHTML(){
+  const q = (S.q||'').trim().toUpperCase().replace('.', '-');
+  if(!q) return '';
+  const a = D.activos.find(x => x.t===q);
+  if(a){
+    const st = filasGatillos('d').filter(r => r.a.t===q);
+    const SL = P.sel || {rs:80, mv:7, score:70};
+    const listas = [esSelA(a) ? 'Seleccionadas' : null, (a.rs>=SL.rs && a.mv>=SL.mv) ? 'Líderes' : null,
+      (D.foco||[]).some(f=>f.t===q) ? 'Lista de foco' : null].filter(Boolean);
+    return `<div class="card busq" data-t="${esc(a.t)}" tabindex="0">
+      <div class="bq1"><span class="gt">${esc(a.t)}</span><span class="mut">${esc(a.nombre)}</span><span class="ver">Abrir ficha →</span></div>
+      <div class="bq2"><span>En el radar · <b>#${D.activos.indexOf(a)+1}</b> de ${D.activos.length} por score</span><span>Score <b>${fmt(a.score,0)}</b></span><span>${xo8(a)}</span><span>RS <b>${fmt(a.rs,0)}</b></span><span>ADR ${adrC(a.adr)}</span></div>
+      <div class="bq3">${st.length ? 'Setups hoy: '+st.map(r=>`<b>${esc(r.nombre)}</b> ${esc(((EST[r.est]||[])[1]||r.badgeTxt||r.est).toLowerCase())}`).join(' · ') : 'Sin setup activo hoy (ni VCP, ni AVWAP con volumen, ni compresión, inside, episodic o 30 min).'}
+        ${listas.length ? '<br>Está en: '+listas.join(', ')+'.' : ''}</div></div>`;
+  }
+  const c = (D.meta.fuera||{})[q];
+  let motivo;
+  if(!c) motivo = 'no está en el universo analizado (acciones y ADRs de EE.UU. con precio, más tus ETFs, cripto y la lista extra).';
+  else if(c==='d') motivo = 'Yahoo no devolvió datos suficientes (hacen falta al menos 60 velas).';
+  else if(c==='p') motivo = `quedó afuera por precio: cotiza debajo de ${P.precio_min} USD.`;
+  else if(c==='l') motivo = 'quedó afuera por liquidez: el volumen diario promedio en dólares está debajo del mínimo.';
+  else if(c==='m') motivo = 'quedó afuera por market cap: está debajo del mínimo.';
+  else if(c==='a') motivo = `quedó afuera por ADR: se mueve menos de ${fmt(P.adr_min,1)}% por día en promedio.`;
+  else if(c[0]==='v'){ const [n, f] = c.slice(1).split(':');
+    motivo = `quedó afuera por Minervini: ${n}/8 (pide ${P.min_mv}). Fallan: ${(f||'').split(',').filter(Boolean).map(k=>MV[+k-1]).join('; ')}.`; }
+  else motivo = 'no aparece en esta corrida.';
+  return `<div class="card busq no"><div class="bq1"><span class="gt">${esc(q)}</span></div><div class="bq3">${esc(q)} ${motivo}</div></div>`;
+}
 function render(){
   const pg = PAGS.find(x=>x[0]===S.pag);
   $('#titulo').textContent = pg[0]==='inicio' ? (D.meta.nombre || 'Radar') : pg[1];
   $('#sub').textContent = pg[2];
   $('#lema').innerHTML = '';
   $('#tf').style.display = S.pag==='gatillos' ? '' : 'none';
-  $('#vista').innerHTML = VISTAS[S.pag]();
+  $('#vista').innerHTML = buscarHTML() + VISTAS[S.pag]();
 }
 function seg(id, key){
   document.querySelectorAll(`#${id} button`).forEach(b => b.addEventListener('click', () => {
@@ -2996,11 +3072,13 @@ function seg(id, key){
 seg('tf','tf'); seg('tipo','tipo');
 $('#rail').addEventListener('click', e => { const b = e.target.closest('[data-pag]'); if(b) ir(b.dataset.pag); });
 $('#q').addEventListener('input', e => { S.q = e.target.value; render(); });
+$('#q').addEventListener('keydown', e => { if(e.key==='Enter'){ const t = (S.q||'').trim().toUpperCase().replace('.', '-'); if(D.activos.some(x=>x.t===t)){ e.preventDefault(); e.target.blur(); setTimeout(()=>ficha(t), 0); } } });
 $('#tvexp').addEventListener('click', exportarTV);
 $('#grandes').addEventListener('click', e => { S.grandes = !S.grandes; e.currentTarget.setAttribute('aria-pressed', S.grandes); render(); });
 $('#vista').addEventListener('click', e => {
   const k = e.target.closest('[data-ir]'); if(k){ ir(k.dataset.ir); return; }
   const gt = e.target.closest('[data-gt]'); if(gt){ S.gTipo = gt.dataset.gt; render(); return; }
+  if(e.target.closest('[data-lidmas]')){ S.lidMas = !S.lidMas; render(); return; }
   if(e.target.closest('[data-trackmas]')){ S.trackMas = !S.trackMas; render(); return; }
   const gf = e.target.closest('[data-gf]'); if(gf){ S[gf.dataset.gf] = !S[gf.dataset.gf]; render(); return; }
   const em2 = e.target.closest('[data-evmas]'); if(em2){ S.evMas = S.evMas || {}; S.evMas[em2.dataset.evmas] = !S.evMas[em2.dataset.evmas]; render(); return; }
