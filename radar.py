@@ -80,6 +80,13 @@ VCP_CIERRES_ADR = 1.5         # "armada": los últimos 5 cierres dentro de este 
 VCP_SOBRE_EMA50 = True
 COMP_RANGO_ADR = 3.0          # compresión: el rango de las últimas 10 velas (6 en semanal) tiene que entrar en este múltiplo del ADR
 COMP_DERIVA_ADR = 1.5         # compresión: el precio no puede haberse movido más de esto (en ADR) en esas velas; si no, es una suba o una caída, no una pausa
+DIAGNOSTICO_FUNDAMENTALES = True  # prueba qué fuentes de valuación responden desde GitHub y lo escribe en el log (después se puede apagar)
+LP_VELAS_DIARIO = 10          # largo plazo: una señal diaria (rebote, cruce, golden cross) cuenta si pasó en las últimas N ruedas
+LP_VELAS_SEMANAL = 3          # y en semanal, en las últimas N semanas
+LP_EMA_SEMANAL = 40           # media larga en semanal: 40 semanas ≈ la EMA200 diaria (la de 200 semanas pide 4 años de historia)
+LP_TOLERANCIA = 1.0           # % por encima de la media que todavía cuenta como "toque"
+LP_RS_MINIMO = 50             # "RS en ascenso": RS de hoy de al menos esto…
+LP_RS_SUBA = 20               # …y que haya subido al menos esto en el último mes
 FORMA_VELAS_DIARIO = 25       # velas que se miran para clasificar la forma de una compresión (triángulo, rango plano, bandera)
 FORMA_VELAS_SEMANAL = 12        # "armada" y "formándose": precio sobre la EMA50
 # **Cierres semanales apretados (TC)**
@@ -352,6 +359,40 @@ SECTORES_NASDAQ = {"Finance": "Financiero", "Health Care": "Salud", "Technology"
                    "Industrials": "Industria", "Real Estate": "Inmobiliario", "Energy": "Energía", "Utilities": "Servicios públicos",
                    "Basic Materials": "Materiales", "Consumer Staples": "Consumo básico", "Telecommunications": "Comunicaciones",
                    "Miscellaneous": "Otros"}
+
+def diagnostico_fundamentales(tickers=("AAPL", "CRM", "NVDA")):
+    """Prueba qué fuentes de valuación (P/E futuro, PEG, precio objetivo, consenso) responden desde donde corre el radar."""
+    import requests
+    print("   Diagnóstico de fuentes de fundamentales:")
+    def mostrar(nombre, t, d):
+        ok = {k: v for k, v in d.items() if v not in (None, "", "N/A", "--")}
+        print(f"     {nombre:22s} {t:5s} {'OK ' if ok else 'NADA'} {ok if ok else ''}")
+    for t in tickers:
+        try:
+            i = yf.Ticker(t).info or {}
+            mostrar("Yahoo info", t, {k: i.get(k) for k in ("forwardPE", "trailingPE", "pegRatio", "trailingPegRatio", "targetMeanPrice",
+                                                              "recommendationKey", "numberOfAnalystOpinions", "revenueGrowth", "earningsGrowth")})
+        except Exception as e: print(f"     Yahoo info             {t:5s} ERROR {str(e)[:80]}")
+        try:
+            pt = yf.Ticker(t).analyst_price_targets or {}
+            mostrar("Yahoo precio objetivo", t, dict(pt) if isinstance(pt, dict) else {})
+        except Exception as e: print(f"     Yahoo precio objetivo  {t:5s} ERROR {str(e)[:80]}")
+        try:
+            ee = yf.Ticker(t).earnings_estimate
+            mostrar("Yahoo EPS estimado", t, {"filas": (len(ee) or None) if ee is not None else None})
+        except Exception as e: print(f"     Yahoo EPS estimado     {t:5s} ERROR {str(e)[:80]}")
+        try:
+            r = requests.get(f"https://api.nasdaq.com/api/quote/{t}/summary?assetclass=stocks",
+                             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=20).json()
+            sd = ((r.get("data") or {}).get("summaryData") or {})
+            mostrar("NASDAQ resumen", t, {k: (sd.get(k) or {}).get("value") for k in ("OneYrTarget", "PERatio", "ForwardPE1Yr", "EarningsPerShare", "MarketCap")})
+        except Exception as e: print(f"     NASDAQ resumen         {t:5s} ERROR {str(e)[:80]}")
+        try:
+            r = requests.get(f"https://api.nasdaq.com/api/analyst/{t}/targetprice",
+                             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=20).json()
+            c = ((r.get("data") or {}).get("consensusOverview") or {})
+            mostrar("NASDAQ analistas", t, {k: c.get(k) for k in ("lowPriceTarget", "highPriceTarget", "priceTarget", "buy", "hold", "sell")})
+        except Exception as e: print(f"     NASDAQ analistas       {t:5s} ERROR {str(e)[:80]}")
 
 def nasdaq_screener():
     """Market cap, sector e industria de todas las acciones de EE.UU. en una sola consulta al screener de NASDAQ.
@@ -1514,6 +1555,82 @@ def alertas_telegram(activos, fecha, resumen=None, regimen_ftd=None):
         print(f"   ⚠️ Telegram: {e}"); return 0
 
 # ---------------------------------------------------------------- rotación (cuadrantes tipo RRG)
+# ---------------------------------------------------------------- largo plazo: EMA200, golden cross y tendencia del RS
+def _cruce_arriba(a, b, ventana):
+    """Velas desde que la serie a cruzó hacia arriba a la b (dentro de la ventana), o None."""
+    n = len(a)
+    for k in range(1, min(ventana, n - 1) + 1):
+        i = n - k
+        if a[i] > b[i] and a[i - 1] <= b[i - 1]: return k - 1
+    return None
+
+def _cruce_abajo(a, b, ventana):
+    return _cruce_arriba(b, a, ventana)
+
+def senales_lp(c, h, l, v, larga, corta, ventana, antes, tol):
+    """Señales sobre una media larga (EMA200 en diario, EMA de LP_EMA_SEMANAL semanas en semanal)."""
+    out = []
+    n = len(c)
+    if n < max(larga, 60) + antes + 5: return out
+    el, ec = ema(pd.Series(c), larga).values, ema(pd.Series(c), corta).values
+    med = pd.Series(v).rolling(50 if n > 120 else 20).median().values
+    sube = el[-1] > el[-1 - min(20, n - 1)]
+    # Rebote: venía arriba, tocó o perforó apenas la media (con la media subiendo) y hoy cierra arriba y rebotando
+    for k in range(ventana):
+        i = n - 1 - k
+        if i - antes < 0: break
+        if l[i] <= el[i] * (1 + tol) and c[i] >= el[i] * (1 - 3 * tol) and c[i - antes] > el[i - antes] and sube and c[-1] > el[-1] and c[-1] > l[i] * 1.01:
+            vols = [v[x] / med[x - 1] for x in range(max(1, i - 2), min(n, i + 3)) if med[x - 1] and med[x - 1] > 0]
+            out.append({"k": "rebote", "hace": k, "climax": num(max(vols), 1) if vols else None}); break
+    # Cruce al alza: primer cierre arriba de la media después de pasar varias velas debajo
+    k = _cruce_arriba(c, el, ventana)
+    if k is not None and c[-1] > el[-1]:
+        i = n - 1 - k
+        if (c[max(0, i - 2 * antes):i] < el[max(0, i - 2 * antes):i]).mean() >= 0.7:
+            vx = v[i] / med[i - 1] if med[i - 1] else None
+            out.append({"k": "cruce", "hace": k, "climax": num(vx, 1) if vx else None})
+    # Golden cross (media corta cruza arriba de la larga) y death cross (al revés)
+    k = _cruce_arriba(ec, el, ventana)
+    if k is not None and ec[-1] > el[-1]: out.append({"k": "golden", "hace": k})
+    k = _cruce_abajo(ec, el, ventana)
+    if k is not None and ec[-1] < el[-1]: out.append({"k": "death", "hace": k})
+    return out
+
+def largo_plazo(diario, tickers, nombres, sectores, mcaps, por_semana, en_radar):
+    """Señales de largo plazo sobre las acciones líquidas y los ETFs: no exige Minervini ni ADR."""
+    ps = por_semana
+    hoy, sem, mes = ps[-1], (ps[-2] if len(ps) > 1 else None), (ps[-5] if len(ps) > 4 else None)
+    # RS de ayer, para el cambio del día
+    arr = {t: df.Close.values for t, df in diario.items() if len(df) >= 61}
+    def rsb(c, e):
+        def r(n): return c[e] / c[e - n] - 1 if e - n >= 0 else c[e] / c[0] - 1
+        return 0.4 * r(63) + 0.2 * r(126) + 0.2 * r(189) + 0.2 * r(252)
+    ayer = pd.Series({t: rsb(c, len(c) - 2) for t, c in arr.items()}).rank(pct=True) * 98 + 1
+    delta = {}
+    for t in hoy.index:
+        r0 = float(hoy[t])
+        delta[t] = (num(r0, 0), num(r0 - ayer[t], 0) if t in ayer.index else None,
+                    num(r0 - sem[t], 0) if sem is not None and t in sem.index else None,
+                    num(r0 - mes[t], 0) if mes is not None and t in mes.index else None)
+    filas = []
+    for t in tickers:
+        df = diario.get(t)
+        if df is None or len(df) < 230: continue
+        c, h, l, v = df.Close.values, df.High.values, df.Low.values, df.Volume.values
+        s = [dict(x, tf="d") for x in senales_lp(c, h, l, v, 200, 50, LP_VELAS_DIARIO, 10, LP_TOLERANCIA / 100)]
+        wk = semanal(df)
+        s += [dict(x, tf="w") for x in senales_lp(wk.Close.values, wk.High.values, wk.Low.values, wk.Volume.values,
+                                                  LP_EMA_SEMANAL, 10, LP_VELAS_SEMANAL, 4, LP_TOLERANCIA / 100)]
+        rs, rs_d, rs_s, rs_m = delta.get(t, (None, None, None, None))
+        acelera = rs is not None and rs_m is not None and rs >= LP_RS_MINIMO and rs_m >= LP_RS_SUBA
+        if not s and not acelera: continue
+        e200 = ema(df.Close, 200).iloc[-1]
+        filas.append({"t": t, "n": nombres.get(t, t), "sector": sectores.get(t, ""), "precio": num(c[-1], 4),
+                      "chg": num((c[-1] / c[-2] - 1) * 100), "mcap": mcaps.get(t), "rs": rs, "rs_d": rs_d, "rs_s": rs_s,
+                      "rs_m": rs_m, "acelera": bool(acelera), "d200": num((c[-1] / e200 - 1) * 100, 1),
+                      "s": s, "radar": t in en_radar, "spark": spark(df.Close, 63)})
+    return filas, delta
+
 def rs_semanas(diario):
     """RS (percentil del universo) de cada activo en las últimas ROTACION_SEMANAS + 1 semanas, de la más vieja a la más nueva."""
     sem = ROTACION_SEMANAS + 1
@@ -1861,8 +1978,21 @@ def correr():
     print(f"   Eventos macro: {len(macro)} · earnings de la semana: {len(earn_cal)}")
     por_semana = rs_semanas(diario)
     rot = rotacion(diario, ETFS, por_semana) if INCLUIR_ETFS else None
+    if DIAGNOSTICO_FUNDAMENTALES and not globals().get("MODO_DEMO"):
+        try: diagnostico_fundamentales()
+        except Exception as e: print(f"   ⚠️ Diagnóstico de fundamentales: {e}")
+    print("   Largo plazo: EMA200, golden cross y tendencia del RS…")
+    lp_tickers = liquidas + [t for t in diario if info.at[t, "tipo"] == "etf"]
+    sectores = {t: str((perf.get(t) or {}).get("sector") or info.at[t, "sector"]) for t in lp_tickers}
+    try:
+        lp, rs_delta = largo_plazo(diario, lp_tickers, {**nombres, **{t: str(info.at[t, "nombre"]) for t in lp_tickers if t not in nombres}},
+                                   sectores, {t: (perf.get(t) or {}).get("mcap") for t in lp_tickers}, por_semana, {a["t"] for a in activos})
+    except Exception as e:
+        print(f"   ⚠️ Largo plazo: {e}"); lp, rs_delta = [], {}
+    print(f"   Largo plazo: {len(lp)} con alguna señal")
     for a in activos:
         a["rs16"] = [num(x.get(a["t"]), 0) if a["t"] in x.index else None for x in por_semana]
+        _, a["rs_d"], a["rs_s"], a["rs_m"] = rs_delta.get(a["t"], (None, None, None, None))
     selh = track_seleccionadas(activos, fecha_iso, diario, spy_c)
     resumen = None
     if RESUMEN_DIARIO and ahora_ar().hour >= 18:
@@ -1875,7 +2005,7 @@ def correr():
     fechas = [df.index[-1] for t, df in diario.items() if info.at[t, "tipo"] != "cripto"] or [hoy]
     datos = {"meta": {
         "fecha_datos": max(fechas).strftime("%d-%m-%Y"), "generado": ahora_ar().strftime("%d-%m-%Y %H:%M"),
-        "n_universo": len(diario), "top": top, "selh": selh, "macro": macro, "earn_cal": earn_cal, "cartelera": cart, "rotacion": rot, "nombre": NOMBRE_DASHBOARD, "lema": LEMA, "avatar": AVATAR_URL, "embudo": [[k, n] for k, n in embudo], "fuera": {t: c for t, c in fuera.items() if t not in {a["t"] for a in activos}}, "n_extra": sum(1 for a in activos if a["sin_av"]), "con30m": con30, "regimen": reg, "demo": bool(globals().get("MODO_DEMO", False)),
+        "n_universo": len(diario), "top": top, "selh": selh, "macro": macro, "earn_cal": earn_cal, "cartelera": cart, "rotacion": rot, "nombre": NOMBRE_DASHBOARD, "lema": LEMA, "avatar": AVATAR_URL, "embudo": [[k, n] for k, n in embudo], "lp": lp, "fuera": {t: c for t, c in fuera.items() if t not in {a["t"] for a in activos}}, "n_extra": sum(1 for a in activos if a["sin_av"]), "con30m": con30, "regimen": reg, "demo": bool(globals().get("MODO_DEMO", False)),
         "params": {"min_mv": MIN_CRITERIOS_MINERVINI, "sobre_min": PCT_SOBRE_MINIMO_52S, "sobre_min_etf": PCT_SOBRE_MINIMO_52S_ETF, "bajo_max": PCT_DEBAJO_MAXIMO_52S,
                    "rs_min": RS_MINIMO, "precio_min": PRECIO_MINIMO, "exigir_av": EXIGIR_AVWAP,
                    "dist_d": DIST_POR_ROMPER_DIARIO, "dist_w": DIST_POR_ROMPER_SEMANAL,
@@ -1885,7 +2015,7 @@ def correr():
                    "vcp_min": VCP_MIN_CONTRACCIONES, "vcp_ult": VCP_ULTIMA_MAX, "vcp_form": VCP_FORMANDO_MAX, "vcp_dist": VCP_DIST_PIVOT,
                    "vcp_seco": VCP_VOL_SECO, "vcp_dias": VCP_DIAS_RUPTURA, "vcp_seg": VCP_DIAS_SEGUIMIENTO,
                    "vcp_smin": VCP_SEMANAS_MIN, "vcp_smax": VCP_SEMANAS_MAX, "emas_asc": EMAS_ASCENSO,
-                   "fuertes": ANCLAS_FUERTES, "exigir_rs": EXIGIR_RS, "castigo": SCORE_CASTIGO_BANDERA, "comp_rango": COMP_RANGO_ADR, "comp_deriva": COMP_DERIVA_ADR, "fuerte": CRECIMIENTO_FUERTE, "tc_min": TC_MIN_CIERRES, "tc_rango": TC_RANGO_MAX, "tc_cerca": TC_CERCA_PIVOT, "cruce_sem": CRUCE_SEMANAS, "rsi_alto": RSI_SOBRECOMPRA, "zona_compra": ZONA_COMPRA_MAX, "resumen_cerca": RESUMEN_CERCA, "cart_n": CARTELERA_N, "rsi_bajo": RSI_SOBREVENTA, "sel": {"rs": SEL_RS_MIN, "mv": SEL_MINERVINI_MIN, "score": SEL_SCORE_MIN}, "top_ruedas": TOP_RUEDAS, "top_n": TOP_N,
+                   "fuertes": ANCLAS_FUERTES, "exigir_rs": EXIGIR_RS, "castigo": SCORE_CASTIGO_BANDERA, "lp_d": LP_VELAS_DIARIO, "lp_w": LP_VELAS_SEMANAL, "lp_ema_w": LP_EMA_SEMANAL, "lp_rs_min": LP_RS_MINIMO, "lp_rs_suba": LP_RS_SUBA, "comp_rango": COMP_RANGO_ADR, "comp_deriva": COMP_DERIVA_ADR, "fuerte": CRECIMIENTO_FUERTE, "tc_min": TC_MIN_CIERRES, "tc_rango": TC_RANGO_MAX, "tc_cerca": TC_CERCA_PIVOT, "cruce_sem": CRUCE_SEMANAS, "rsi_alto": RSI_SOBRECOMPRA, "zona_compra": ZONA_COMPRA_MAX, "resumen_cerca": RESUMEN_CERCA, "cart_n": CARTELERA_N, "rsi_bajo": RSI_SOBREVENTA, "sel": {"rs": SEL_RS_MIN, "mv": SEL_MINERVINI_MIN, "score": SEL_SCORE_MIN}, "top_ruedas": TOP_RUEDAS, "top_n": TOP_N,
                    "pts": {"tend": PUNTOS_TENDENCIA, "rs": PUNTOS_RS, "contr": PUNTOS_COMPRESION, "setup": PUNTOS_SETUP, "fund": PUNTOS_FUNDAMENTALES}, "est10": ESTIRADA_EMA10_ADR, "est20": ESTIRADA_EMA20_ADR,
                    "foco_rs": FOCO_RS_MINIMO, "foco_riesgo": FOCO_RIESGO_MAX, "foco_max": FOCO_MAXIMO}},
         "foco": foco, "activos": sorted(activos, key=lambda a: -a["score"])}
@@ -2332,8 +2462,10 @@ const PAGS = [
   ['inicio','Hoy','Lo que hay que mirar para la próxima rueda.'],
   ['gatillos','Gatillos','Todos los setups en una tabla: VCP, AVWAP, compresión, inside, episodic y 30 min.'],
   ['ranking','Ranking','Las mejores del radar y si los filtros están funcionando.'],
+  ['largo','Largo plazo','Señales para posiciones de meses o años: rebote y cruce de la EMA200, golden cross y RS en ascenso.'],
   ['mercado','Mercado','Régimen, rotación, sectores y cartelera del día.'],
 ];
+IC.largo = '<path d="M3 20l6-9 4 5 3-4 5 8z"/><path d="M14 6l2-3 2 3"/>';
 IC.ranking = '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M17 5h3a3 3 0 0 1-3 4M7 5H4a3 3 0 0 0 3 4"/>';
 IC.mercado = '<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>';
 IC.inicio = '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>';
@@ -2692,6 +2824,7 @@ function lideresHTML(){
     TEND,
     {h:'3 meses', f:r=>spark(r.a.spark_d)},
     {h:'RS', n:1, f:r=>`<b>${fmt(r.a.rs,0)}</b>`},
+    {h:'Δ RS mes', n:1, f:r=>dRS(r.a.rs_m)},
     {h:'Score', n:1, f:r=>`<span class="scp">${fmt(r.a.score,0)}</span>`},
     {h:'Desde el máx. 52s', n:1, f:r=>`<span class="${cls(r.a.off_hi)}">${pct(r.a.off_hi,1)}</span>`},
     {h:'ADR', n:1, f:r=>adrC(r.a.adr)},
@@ -2910,6 +3043,77 @@ function vGatillos(){
     </details>`;
 }
 
+/* ---------- Largo plazo ---------- */
+const dRS = v => v==null ? '<span class="mut">–</span>' : `<b class="${v>0?'up':v<0?'down':'mut'}">${v>0?'+':''}${fmt(v,0)}</b>`;
+function lpNombre(x){
+  const w = x.tf==='w', m = w ? `EMA${P.lp_ema_w} semanal` : 'EMA200';
+  return {rebote:`Rebote en la ${m}`, cruce:`Cruce al alza de la ${m}`, golden:w?'Golden cross semanal (10/'+P.lp_ema_w+')':'Golden cross (EMA50/200)', death:w?'Death cross semanal':'Death cross (EMA50/200)'}[x.k] || x.k;
+}
+const lpHace = x => x.hace===0 ? 'hoy' : `hace ${x.hace} ${x.tf==='w' ? (x.hace===1?'semana':'semanas') : (x.hace===1?'rueda':'ruedas')}`;
+function lpSenalHTML(x){
+  return `<div class="gset"><div class="gs1"><span class="gsn">${esc(lpNombre(x))}</span><span class="est ${x.k==='death'?'falla':'rompe'}">${esc(lpHace(x))}</span>${x.climax!=null && x.climax>=1.5?`<span class="lset ok" title="Volumen de ese día contra su mediana de 50">clímax ×${fmt(x.climax,1)}</span>`:''}</div></div>`;
+}
+function lpRsHTML(x){
+  if(x.rs==null) return '';
+  const desde = x.rs_m!=null ? x.rs - x.rs_m : null;
+  return `<div class="gset"><div class="gs1"><span class="gsn">RS ${desde!=null?`${fmt(desde,0)} → `:''}${fmt(x.rs,0)}</span>${x.acelera?'<span class="est rompe">en ascenso</span>':''}</div>
+    <div class="gs2"><span>Δ día ${dRS(x.rs_d)}</span><span>Δ semana ${dRS(x.rs_s)}</span><span>Δ mes ${dRS(x.rs_m)}</span><span>vs EMA200 <b class="${cls(x.d200)}">${pct(x.d200,1)}</b></span></div></div>`;
+}
+function vLargo(){
+  const tf = S.tf, q = (S.q||'').trim().toLowerCase();
+  const base = (D.meta.lp||[]).filter(x => (S.tipo==='todo' || (S.tipo==='etf' ? x.sector==='ETF' : S.tipo==='accion' ? x.sector!=='ETF' : false))
+    && (!S.grandes || x.sector==='ETF' || (x.mcap||0) >= 1e10)
+    && (!q || x.t.toLowerCase().includes(q) || (x.n||'').toLowerCase().includes(q)));
+  const F = [['','Todas'],['rebote','Rebote EMA200'],['cruce','Cruce EMA200'],['golden','Golden cross'],['acelera','RS en ascenso'],['death','Cruces bajistas']];
+  const pasa = (x, k) => {
+    const s = (x.s||[]).filter(z => z.tf===tf);
+    if(!k) return s.some(z => z.k!=='death') || x.acelera;
+    if(k==='acelera') return x.acelera;
+    return s.some(z => z.k===k);
+  };
+  const cnt = k => base.filter(x => pasa(x, k)).length;
+  const l = base.filter(x => pasa(x, S.lpF||'')).sort((a,b) => {
+    const na = (a.s||[]).filter(z=>z.tf===tf && z.k!=='death').length + (a.acelera?1:0), nb = (b.s||[]).filter(z=>z.tf===tf && z.k!=='death').length + (b.acelera?1:0);
+    return nb-na || (b.rs||0)-(a.rs||0); });
+  const n = S.lpMas ? l.length : 40;
+  const tarjeta = x => {
+    const s = (x.s||[]).filter(z => z.tf===tf && (S.lpF==='death' ? z.k==='death' : z.k!=='death'));
+    return `<div class="gacc" data-t="${esc(x.t)}" tabindex="0">
+      <div class="gtk"><div class="gt">${esc(x.t)}</div><div class="gsc">RS <b>${fmt(x.rs,0)}</b> ${x.rs_m!=null?`<span class="${cls(x.rs_m)}">(${x.rs_m>0?'+':''}${fmt(x.rs_m,0)} mes)</span>`:''}</div>
+        <div class="gbd">${x.radar?'<span class="selb" title="También está en el radar de rupturas">RADAR</span>':''}${x.mcap?`<span class="mut" style="font-size:11.5px">${big(x.mcap)}</span>`:''}</div></div>
+      <div class="gsets"><div class="gs3" style="margin:0 0 6px">${esc(x.n)}${x.sector?' · '+esc(x.sector):''} · ${pr(x.precio)} <span class="${cls(x.chg)}">${pct(x.chg)}</span></div>
+        ${s.map(lpSenalHTML).join('')}${lpRsHTML(x)}</div></div>`;
+  };
+  return `<div class="subnav">${F.map(([k,t])=>`<button class="chip" data-lpf="${k}" aria-pressed="${(S.lpF||'')===k}">${t} <span class="mut">${cnt(k)}</span></button>`).join('')}</div>
+    ${card('Largo plazo · '+TFN[tf], `${l.length} acciones y ETFs líquidos`, l.length ? l.slice(0, n).map(tarjeta).join('')
+      + (l.length > 40 ? `<button class="chip" data-lpmas="1" style="margin-top:6px">${S.lpMas ? 'Ver menos' : 'Ver las '+(l.length-40)+' restantes'}</button>` : '')
+      : '<p class="vacio">Ninguna señal con estos filtros.</p>')}
+    <details class="ayuda"><summary>Cómo leer cada señal</summary>
+      <p>Se revisan todas las acciones líquidas y los ETFs, <b>sin</b> exigir Minervini ni ADR: un rebote en la EMA200 muchas veces pasa justo cuando la tendencia de corto todavía no se recuperó. Las marcadas RADAR además pasan los filtros del radar de rupturas.</p>
+      <p><b>Rebote en la EMA200</b>: venía arriba, tocó o perforó apenas la media (con la media subiendo) y hoy cierra arriba y rebotando. Si ese día hubo volumen de 1,5x o más su mediana de 50 aparece <b>clímax</b>.</p>
+      <p><b>Cruce al alza de la EMA200</b>: primer cierre arriba de la media después de pasar varias semanas debajo. Suele marcar el cambio de etapa 1 a 2.</p>
+      <p><b>Golden cross</b>: la EMA50 cruza arriba de la EMA200. <b>Death cross</b> es lo contrario: aviso de deterioro (se ve en "Cruces bajistas").</p>
+      <p><b>Semanal</b>: lo mismo con la EMA de ${P.lp_ema_w} semanas (equivale a la EMA200 diaria; la de 200 semanas pide 4 años de historia) y golden cross de 10 y ${P.lp_ema_w} semanas. Una señal cuenta si pasó en las últimas ${P.lp_d} ruedas o ${P.lp_w} semanas.</p>
+      <p><b>RS en ascenso</b>: RS de ${P.lp_rs_min} o más que subió ${P.lp_rs_suba} puntos o más en el último mes. Son líderes en formación, antes de llegar arriba del ranking.</p>
+    </details>`;
+}
+// Ficha para acciones que no están en el radar de rupturas pero tienen señales de largo plazo
+function fichaLP(t){
+  const x = (D.meta.lp||[]).find(z => z.t===t); if(!x) return;
+  const tv = x.t.replace('-', '.');
+  $('#ficha').innerHTML = `
+    <div class="fh"><div><h2>${esc(x.t)}</h2><p>${esc(x.n)}${x.sector?' · '+esc(x.sector):''}</p></div><button class="cerrar" id="cerrar" aria-label="Cerrar ficha">✕</button></div>
+    <div class="precio">${pr(x.precio)} <span class="${cls(x.chg)}">${pct(x.chg)}</span> </div>
+    <div style="margin-top:12px">${spark(x.spark, 420, 72)}</div>
+    <p class="nota" style="margin-top:12px">No pasa los filtros del radar de rupturas (Minervini o ADR); aparece por sus señales de largo plazo.</p>
+    <h4>Señales</h4>${(x.s||[]).map(z=>`<div class="kv"><span>${esc(lpNombre(z))}</span><span>${esc(lpHace(z))}${z.climax!=null&&z.climax>=1.5?' · clímax ×'+fmt(z.climax,1):''}</span></div>`).join('') || '<p class="vacio">Solo RS en ascenso.</p>'}
+    <h4>Fuerza relativa</h4><div class="kv"><span>RS</span><span>${fmt(x.rs,0)}</span><span>Δ día / semana / mes</span><span>${dRS(x.rs_d)} / ${dRS(x.rs_s)} / ${dRS(x.rs_m)}</span>
+      <span>vs EMA200</span><span class="${cls(x.d200)}">${pct(x.d200,1)}</span>${x.mcap?`<span>Market cap</span><span>${big(x.mcap)}</span>`:''}</div>
+    <a class="enlace" href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tv)}" target="_blank" rel="noopener">Abrir en TradingView</a>`;
+  $('#ficha').classList.add('open'); $('#velo').classList.add('open'); $('#ficha').setAttribute('aria-hidden','false');
+  $('#cerrar').focus();
+}
+
 /* ---------- Ficha ---------- */
 const MV = ['Precio sobre EMA150 y EMA200','EMA150 sobre EMA200','EMA200 subiendo (22 velas)','EMA50 sobre EMA150 y EMA200','Precio sobre EMA50',
   `${P.sobre_min}% o más sobre el mínimo de 252 velas (${P.sobre_min_etf}% en ETFs)`, `Dentro del ${P.bajo_max}% del máximo de 252 velas`, 'Línea de RS vs SPY sobre su media de 50'];
@@ -2950,7 +3154,7 @@ function rsLinea(v){
     <text x="0" y="${h+13}" class="ax">línea punteada = RS 80</text><text x="${w}" y="${h+13}" text-anchor="end" class="ax">hoy ${fmt(ult,0)}${ant!=null?' · hace un mes '+fmt(ant,0):''}</text></svg>`;
 }
 function ficha(t){
-  const a = D.activos.find(x=>x.t===t); if(!a) return;
+  const a = D.activos.find(x=>x.t===t); if(!a) return fichaLP(t);
   const PT = pilares(a);
   const tvSym = a.tipo==='cripto' ? a.t.replace('-','') : a.t.replace('-','.');
   const avt = tf => (a.avwap[tf]||[]).length ? `<div class="tw"><table><thead><tr><th>Ancla</th><th class="n">AVWAP</th><th class="n">Dist.</th><th class="n">Vol.</th><th>Estado</th></tr></thead><tbody>${
@@ -2980,7 +3184,7 @@ function ficha(t){
       <span>Vol. prom. 50 ruedas</span><span>${a.dvol50!=null?'USD '+big(a.dvol50)+' · ':''}${big(a.vol50)} acciones</span>
       <span>Volumen hoy</span><span>${big(a.vol_hoy)} · ${volx(a)} vs prom. 50</span>
       <span>Up/Down volume 50 días</span><span class="${a.ud50>=1?'up':'down'}">${a.ud50!=null?fmt(a.ud50,2):'s/d'}${a.ud50!=null?(a.ud50>=1?' · acumulación':' · distribución'):''}</span>
-      <span>RS Rating</span><span>${fmt(a.rs,0)}</span>
+      <span>RS Rating</span><span>${fmt(a.rs,0)} · Δ día ${dRS(a.rs_d)} · semana ${dRS(a.rs_s)} · mes ${dRS(a.rs_m)}</span>
       ${a.etf ? `<span>ETF del sector</span><span>${esc(a.etf.t)}${a.etf.rs!=null?' · RS '+fmt(a.etf.rs,0):''} · <span class="${cls(a.etf.chg)}">${pct(a.etf.chg)}</span></span>
         <span>Vs. ${esc(a.etf.t)} a 1 / 3 meses</span><span><span class="${cls(a.etf.vs1m)}">${pct(a.etf.vs1m,1)}</span> / <span class="${cls(a.etf.vs3m)}">${pct(a.etf.vs3m,1)}</span></span>` : ''}
     </div>
@@ -3018,8 +3222,8 @@ function ficha(t){
 function cerrarFicha(){ $('#ficha').classList.remove('open'); $('#velo').classList.remove('open'); $('#ficha').setAttribute('aria-hidden','true'); }
 
 /* ---------- Navegación y eventos ---------- */
-const CORTO = {};
-const VISTAS = {inicio:vInicio, gatillos:vGatillos, ranking:vRanking, mercado:vMercado};
+const CORTO = {largo:'Largo'};
+const VISTAS = {inicio:vInicio, gatillos:vGatillos, ranking:vRanking, largo:vLargo, mercado:vMercado};
 const LOGO_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>';
 $('#rail').innerHTML = `<div class="logo">${D.meta.avatar ? `<img src="${esc(D.meta.avatar)}" alt="" referrerpolicy="no-referrer" onerror="this.parentNode.innerHTML=LOGO_SVG">` : LOGO_SVG}</div>` +
   PAGS.map(([k,n])=>`<button data-pag="${k}" aria-current="${S.pag===k?'page':'false'}">${ico(k)}<span class="lg">${n}</span><span class="ct">${CORTO[k]||n}</span></button>`).join('');
@@ -3054,14 +3258,16 @@ function buscarHTML(){
   else if(c[0]==='v'){ const [n, f] = c.slice(1).split(':');
     motivo = `quedó afuera por Minervini: ${n}/8 (pide ${P.min_mv}). Fallan: ${(f||'').split(',').filter(Boolean).map(k=>MV[+k-1]).join('; ')}.`; }
   else motivo = 'no aparece en esta corrida.';
-  return `<div class="card busq no"><div class="bq1"><span class="gt">${esc(q)}</span></div><div class="bq3">${esc(q)} ${motivo}</div></div>`;
+  const lpx = (D.meta.lp||[]).find(z => z.t===q);
+  const extra = lpx ? `<br>Igual tiene señales de largo plazo: ${(lpx.s||[]).map(z=>esc(lpNombre(z))+' '+esc(lpHace(z))).join(' · ') || 'RS en ascenso'}. Tocá para ver su ficha.` : '';
+  return `<div class="card busq ${lpx?'':'no'}" ${lpx?`data-t="${esc(q)}" tabindex="0"`:''}><div class="bq1"><span class="gt">${esc(q)}</span>${lpx?'<span class="ver">Abrir ficha →</span>':''}</div><div class="bq3">${esc(q)} ${motivo}${extra}</div></div>`;
 }
 function render(){
   const pg = PAGS.find(x=>x[0]===S.pag);
   $('#titulo').textContent = pg[0]==='inicio' ? (D.meta.nombre || 'Radar') : pg[1];
   $('#sub').textContent = pg[2];
   $('#lema').innerHTML = '';
-  $('#tf').style.display = S.pag==='gatillos' ? '' : 'none';
+  $('#tf').style.display = (S.pag==='gatillos' || S.pag==='largo') ? '' : 'none';
   $('#vista').innerHTML = buscarHTML() + VISTAS[S.pag]();
 }
 function seg(id, key){
@@ -3078,6 +3284,8 @@ $('#grandes').addEventListener('click', e => { S.grandes = !S.grandes; e.current
 $('#vista').addEventListener('click', e => {
   const k = e.target.closest('[data-ir]'); if(k){ ir(k.dataset.ir); return; }
   const gt = e.target.closest('[data-gt]'); if(gt){ S.gTipo = gt.dataset.gt; render(); return; }
+  const lf = e.target.closest('[data-lpf]'); if(lf){ S.lpF = lf.dataset.lpf; render(); return; }
+  if(e.target.closest('[data-lpmas]')){ S.lpMas = !S.lpMas; render(); return; }
   if(e.target.closest('[data-lidmas]')){ S.lidMas = !S.lidMas; render(); return; }
   if(e.target.closest('[data-trackmas]')){ S.trackMas = !S.trackMas; render(); return; }
   const gf = e.target.closest('[data-gf]'); if(gf){ S[gf.dataset.gf] = !S[gf.dataset.gf]; render(); return; }
