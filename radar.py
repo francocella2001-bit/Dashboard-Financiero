@@ -42,11 +42,11 @@ ALERTAS_TELEGRAM = True
 URL_DASHBOARD = "https://francocella2001-bit.github.io/Dashboard-Financiero/"
 RESUMEN_DIARIO = True   # un resumen por Telegram con la primera corrida desde las 18 h (Argentina), ya con la vela cerrada
 RESUMEN_CERCA = 2.0     # % máximo hasta el pivot o la AVWAP para figurar como "armada para mañana"
-# **Lista de foco y score**
-FOCO_MAXIMO = 10
+# **Crème de la crème y score**
+FOCO_MAXIMO = 12
 FOCO_RS_MINIMO = 80
 FOCO_RIESGO_MAX = 8.0
-ZONA_COMPRA_MAX = 5.0  # % máximo sobre la entrada para seguir en Lista de foco / Crème (más arriba ya está extendida)
+ZONA_COMPRA_MAX = 5.0  # % máximo sobre la entrada para seguir en la Crème (más arriba ya está extendida)
 SCORE_CASTIGO_BANDERA = 5
 # **Pesos del score** (tienen que sumar 100)
 PUNTOS_TENDENCIA = 20
@@ -78,6 +78,7 @@ VCP_LEJOS_MAXIMO_52S = 15     # % máximo del pivot por debajo del máximo de 52
 VCP_VOL_DECRECIENTE = True    # el volumen de la última contracción tiene que ser menor que el de la primera
 VCP_CIERRES_ADR = 1.5         # "armada": los últimos 5 cierres dentro de este múltiplo del ADR (lado derecho quieto)
 VCP_SOBRE_EMA50 = True
+ANCLA_VELAS_RECIENTES = 2     # AVWAP: si el máximo/mínimo/volumen real está en las últimas N velas diarias, todavía no se usa como ancla
 COMP_RANGO_ADR = 3.0          # compresión: el rango de las últimas 10 velas (6 en semanal) tiene que entrar en este múltiplo del ADR
 COMP_DERIVA_ADR = 1.5         # compresión: el precio no puede haberse movido más de esto (en ADR) en esas velas; si no, es una suba o una caída, no una pausa
 DIAGNOSTICO_FUNDAMENTALES = True  # prueba qué fuentes de valuación responden desde GitHub y lo escribe en el log (después se puede apagar)
@@ -878,25 +879,28 @@ def anclas(df, tf, earn=None, es_ipo=False, ep_ts=None):
     if ep_ts is not None:
         i = int(df.index.searchsorted(ep_ts))
         if i < n - 2: res.append(("Episodic pivot", i))
-    seg = df.iloc[ini:n - k]
+    # Se toma el extremo REAL de la ventana. Si cae en las últimas velas, todavía no sirve de ancla y se omite
+    # (antes se salteaban esas velas y el ancla terminaba en un máximo o mínimo que no era el verdadero).
+    reciente = n - (ANCLA_VELAS_RECIENTES if tf == "d" else 1)
+    seg = df.iloc[ini:n]
     if len(seg) and seg.Volume.max() > 0:
-        res.append(("Alto volumen", df.index.get_loc(seg.Volume.idxmax())))
-    seg = df.iloc[ini:n - k]
+        i = df.index.get_loc(seg.Volume.idxmax())
+        if i < reciente: res.append(("Alto volumen", i))
     if len(seg):
-        res.append(("Máx. estructural", df.index.get_loc(seg.High.idxmax())))
-    if n > k:
-        i = int(np.argmax(df.High.values[:n - k]))
-        if i < ini and i >= n - lim_ath: res.append(("Máx. histórico", i))
-    seg = df.iloc[ini:n - k]
+        i = df.index.get_loc(seg.High.idxmax())
+        if i < reciente: res.append(("Máx. estructural", i))
+    i = int(np.argmax(df.High.values))
+    if i < ini and i >= n - lim_ath: res.append(("Máx. histórico", i))
     if len(seg):
-        res.append(("Mín. estructural", df.index.get_loc(seg.Low.idxmin())))
-    # mínimo del último mes (21 ruedas o 4 semanas), sin contar las 2 últimas velas
-    seg = df.iloc[max(0, n - (21 if tf == "d" else 4) - 2):n - 2]
+        i = df.index.get_loc(seg.Low.idxmin())
+        if i < reciente: res.append(("Mín. estructural", i))
+    # mínimo del último mes (21 ruedas o 4 semanas)
+    seg = df.iloc[max(0, n - (21 if tf == "d" else 4)):n]
     if len(seg):
-        res.append(("Mín. mensual", df.index.get_loc(seg.Low.idxmin())))
-    if n > k:
-        i = int(np.argmin(df.Low.values[:n - k]))
-        if i < ini and i >= n - lim_ath: res.append(("Mín. histórico", i))
+        i = df.index.get_loc(seg.Low.idxmin())
+        if i < reciente: res.append(("Mín. mensual", i))
+    i = int(np.argmin(df.Low.values))
+    if i < ini and i >= n - lim_ath: res.append(("Mín. histórico", i))
     if es_ipo: res.append(("IPO", 0))
     vistos, out = set(), []
     for nom, i in res:
@@ -1753,22 +1757,46 @@ def cartelera(diario, tickers, nombres, mcaps=None):
             "sobrecompra": [fr(t) for t in caro], "sobreventa": [fr(t) for t in barato]}
 
 # ---------------------------------------------------------------- score
-def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv, vcp=None, fund=None, tc=None):
+def base_pivot(df, vcp=None):
+    """Pivot de la base: el de la VCP si hay; si no, el máximo de las últimas 3 a 13 semanas (tiene que tener al menos 3 semanas)."""
+    if vcp: return float(vcp["pivot"]), "VCP"
+    c = df.Close.values
+    if len(df) < 70: return None, None
+    v = df.High.iloc[-65:].values
+    i = int(np.argmax(v))
+    if len(v) - 1 - i < 15: return None, None    # el máximo es muy reciente: todavía no hay base
+    return float(v[i]), "máx. de la base"
+
+def puntos_estructura(df, vcp, tc, comp_d, emas_ok):
+    """Setup por estructura (sobre 20): cerca del pivot, VCP, cierres apretados, volumen seco y EMAs. No usa AVWAP ni gatillos intradía."""
+    det, pts = {}, 0.0
+    pivot, origen = base_pivot(df, vcp)
+    if pivot:
+        d = (df.Close.iloc[-1] / pivot - 1) * 100
+        if -5 <= d <= 3: p = 8.0
+        elif -15 < d < -5: p = 8 * (d + 15) / 10
+        elif 3 < d < 10: p = 8 * (10 - d) / 7
+        else: p = 0.0
+        pts += p; det["pivot"] = [num(pivot, 4), origen, num(d, 1), num(p, 1)]
+    if vcp:
+        p = {"armada": 6, "recien": 6, "confirmo": 4, "formandose": 2}.get(vcp["estado"], 0)
+        pts += p; det["vcp"] = p
+    if tc:
+        p = 3 + (2 if tc["seco"] and tc["cerca"] else 0)
+        pts += p; det["tc"] = p
+    if comp_d and comp_d.get("vol_r") is not None and comp_d["vol_r"] < 0.8:
+        pts += 2; det["seco"] = 2
+    if emas_ok:
+        pts += 2; det["emas"] = 2
+    return min(pts, 20.0), det
+
+def partes_score(mv, rs, comp_d, sav_d, comp_d_rup, ins_d, piv, vcp=None, fund=None, tc=None, estructura=None):
     tend = mv / 8 * PUNTOS_TENDENCIA
     fuer = rs / 99 * PUNTOS_RS
     contr = (comp_d["score"] if comp_d else 0) / 100 * PUNTOS_COMPRESION
-    setup = 0.0
-    if sav_d:
-        setup += 12 if sav_d["estado"] == "rompe" else 7
-    if comp_d_rup: setup += 6
-    if ins_d and ins_d.get("n", 0) >= 1: setup += 3 if ins_d["n"] == 1 else 5
-    if piv and piv.get("estado") != "esperando": setup += 4
-    if vcp:
-        e = vcp["estado"]
-        if e == "armada": setup += 6
-        elif e == "recien": setup += 8 if (vcp["vol_rup"] or 0) >= VOL_RUPTURA else 4
-        elif e == "confirmo": setup += 4
-    if tc: setup += TC_PUNTOS + (2 if tc["seco"] and tc["cerca"] else 0)
+    # El setup puntúa ESTRUCTURA (base cerca del pivot, VCP, cierres apretados, volumen seco, EMAs).
+    # Los gatillos (AVWAP, 30 min, inside, ruptura de compresión) se ven en Gatillos pero no suman.
+    setup = estructura if estructura is not None else 0.0
     fu = (fund["pts_eps"] + fund["pts_ventas"]) if (fund and PUNTOS_FUNDAMENTALES > 0) else 0.0
     return {"tend": num(tend, 1), "rs": num(fuer, 1), "contr": num(contr, 1),
             "setup": num(min(setup, 20) / 20 * PUNTOS_SETUP, 1), "fund": num(fu, 1)}
@@ -1779,21 +1807,24 @@ def _comprimida(a):
     return any(a["comp"][k] and (a["comp"][k]["es"] or a["comp"][k]["ruptura"]) for k in ("d", "w"))
 
 def lista_foco(activos):
-    """Hasta FOCO_MAXIMO activos con un setup concreto para operar, sin banderas malas, por score."""
+    """Crème de la crème: Seleccionadas con un setup de estructura cerca o recién roto, sin banderas malas,
+    con riesgo acotado y todavía en zona de compra. El AVWAP no entra (queda en Gatillos y en Telegram)."""
     out = []
     for a in activos:
-        if a["rs"] < FOCO_RS_MINIMO: continue
+        if not es_seleccionada(a): continue
         if any(f["k"] in ("rechazo", "sinvol", "ext", "estirada", "earn") for f in a["flags"]): continue
         precio, op = a["precio"], []
         v = a["vcp"]
-        if v and v["estado"] in ("armada", "recien"):
-            op.append(("VCP " + ("armada" if v["estado"] == "armada" else "recién rota"), v["pivot"], v["stop"]))
+        if v:
+            if v["estado"] == "recien": op.append(("VCP recién rota", v["pivot"], v["stop"]))
+            elif v["estado"] == "armada" or (v.get("dist") is not None and -RESUMEN_CERCA <= v["dist"] <= 0):
+                op.append(("VCP " + v["estado"], v["pivot"], v["stop"]))
         c = a["comp"]["d"]
         if c and c["emas"] and (c["ruptura"] or (c["es"] and c["dist_gatillo"] is not None and c["dist_gatillo"] <= CERCA_GATILLO)):
             op.append(("Compresión " + ("rota" if c["ruptura"] else "preparada"), c["gatillo"], c["piso"]))
-        s = a["setup_av"]["d"]
-        if s and s["estado"] == "rompe":
-            op.append((f"Ruptura AVWAP {s['ancla'].lower()}", s["entrada"], s["stop"]))
+        i = (a.get("inside") or {}).get("d")
+        if i and i.get("n", 0) >= 1 and i.get("dist_hi") is not None and i["dist_hi"] <= RESUMEN_CERCA:
+            op.append(((f"{i['n']} " if i["n"] > 1 else "") + "inside day", i["madre_hi"], i["madre_lo"]))
         for nombre, ent, stop in op:
             if not ent or not stop or ent <= stop: continue
             riesgo = (ent - stop) / ent * 100
@@ -1802,6 +1833,11 @@ def lista_foco(activos):
             out.append({"t": a["t"], "setup": nombre, "entrada": num(ent, 4), "stop": num(stop, 4),
                         "riesgo": num(riesgo, 1), "dist": num((precio / ent - 1) * 100), "score": a["score"]})
             break
+        else:
+            tc = a.get("tc")
+            if tc and tc.get("cerca"):  # cierres apretados: sin entrada/stop propios
+                out.append({"t": a["t"], "setup": f"{tc['n']} cierres apretados (TC)", "entrada": None, "stop": None,
+                            "riesgo": None, "dist": tc.get("dist"), "score": a["score"]})
     out.sort(key=lambda x: -x["score"])
     return out[:FOCO_MAXIMO]
 
@@ -1954,8 +1990,14 @@ def correr():
         a["fund"] = fund.get(a["t"])
         if a["fund"] and a["fund"]["eps_ttm"] and a["fund"]["eps_ttm"] > 0:
             a["fund"]["pe"] = num(a["precio"] / a["fund"]["eps_ttm"], 1)
+        dfx = dfs_d.get(a["t"])
+        if dfx is not None:
+            emas_ok = emas_en_ascenso(dfx) and all(dfx.Close.iloc[-1] > ema(dfx.Close, k).iloc[-1] for k in (10, 20, 50))
+            est_pts, a["estructura"] = puntos_estructura(dfx, a["vcp"], a["tc"], a["comp"]["d"], emas_ok)
+        else:
+            est_pts, a["estructura"] = 0.0, {}
         p = partes_score(a["mv"], a["rs"], a["comp"]["d"], a["setup_av"]["d"],
-                         a["comp"]["d"] and a["comp"]["d"]["ruptura"], a["inside"]["d"], a["pivot30"], a["vcp"], a["fund"], a["tc"])
+                         a["comp"]["d"] and a["comp"]["d"]["ruptura"], a["inside"]["d"], a["pivot30"], a["vcp"], a["fund"], a["tc"], est_pts)
         if a["tipo"] != "accion" and 0 < PUNTOS_FUNDAMENTALES < 100:
             # ETFs y cripto no tienen balances: el pilar no aplica y los otros cuatro se reescalan a 100
             k = 100 / (100 - PUNTOS_FUNDAMENTALES)
@@ -2001,7 +2043,7 @@ def correr():
     n_al = alertas_telegram(activos, fecha_iso, resumen, (reg or {}).get("ftd"))
     print(f"   Seleccionadas: {sum(es_seleccionada(a) for a in activos)} · alertas enviadas: {n_al}")
     print(f"   Top {TOP_N}: {top['medio']}% promedio en {top['ruedas']} ruedas vs SPY {top['spy']}%")
-    print(f"   Lista de foco: {len(foco)}")
+    print(f"   Crème de la crème: {len(foco)}")
     fechas = [df.index[-1] for t, df in diario.items() if info.at[t, "tipo"] != "cripto"] or [hoy]
     datos = {"meta": {
         "fecha_datos": max(fechas).strftime("%d-%m-%Y"), "generado": ahora_ar().strftime("%d-%m-%Y %H:%M"),
@@ -2490,7 +2532,7 @@ const EMAS_N = ['E10','E20','E50','E150','E200'];
 const tend = a => `<span class="tend">${xo8(a)}<span class="ars">${(a.pend||[]).map((v,i)=>flecha(v,EMAS_N[i])).join('')}<i></i>${flecha(a.m1d,'Momentum diario')}${flecha(a.m1w,'Momentum semanal')}</span></span>`;
 const adrC = v => v==null ? '<span class="mut">s/d</span>' : `<span class="adr${v<1.5?0:v<2.5?1:v<4.5?2:v<6?3:4}">${fmt(v,2)}%</span>`;
 const volx = a => a.vol_pct==null ? '–' : `<span class="${a.vol_pct>0?'up':'mut'}">${pct(a.vol_pct,0)}</span>`;
-const PILARES = [['Tendencia','tend',P.pts.tend,'var(--blue)'],['Fuerza RS','rs',P.pts.rs,'var(--acc)'],['Contracción','contr',P.pts.contr,'var(--violet)'],['Setup','setup',P.pts.setup,'var(--warn)'],['Fundamentales','fund',P.pts.fund,'#e879a6']];
+const PILARES = [['Tendencia','tend',P.pts.tend,'var(--blue)'],['Fuerza RS','rs',P.pts.rs,'var(--acc)'],['Contracción','contr',P.pts.contr,'var(--violet)'],['Estructura','setup',P.pts.setup,'var(--warn)'],['Fundamentales','fund',P.pts.fund,'#e879a6']];
 const PIL = PILARES.filter(x => x[1]!=='fund' || P.pts.fund > 0);
 const pilares = a => P.pts.fund <= 0 ? PIL : (a.partes && a.partes.fund==null && a.tipo!=='accion')
   ? PILARES.filter(x=>x[1]!=='fund').map(([n,k,m,c])=>[n, k, +(m*100/(100-P.pts.fund)).toFixed(1), c]) : PILARES;
@@ -2653,20 +2695,6 @@ function bloques(){
   const top = act.slice().sort((x,y)=>y.score-x.score).slice(0,3);
   const idx = Object.fromEntries(D.activos.map(a=>[a.t,a]));
   const fl = (D.foco||[]).filter(f=>idx[f.t] && visibles(true).includes(idx[f.t]));
-  let AMBAS = new Set();
-  const ambas = t => AMBAS.has(t) ? ' <span class="ambas" title="Está en la Lista de foco y en la Crème de la crème">⭐ ambas</span>' : '';
-  const cFo = [
-    {h:'Ticker', f:r=>tk(idx[r.t])+ambas(r.t)},
-    {h:'Setup', f:r=>esc(r.setup)},
-    {h:'Entrada', n:1, f:r=>pr(r.entrada)},
-    {h:'Stop', n:1, f:r=>pr(r.stop)},
-    {h:'Riesgo', n:1, f:r=>fmt(r.riesgo,1)+'%'},
-    {h:'Precio vs. entrada', n:1, f:r=>`<span class="${cls(r.dist)}">${pct(r.dist)}</span>`},
-    {h:'Score', n:1, f:r=>fmt(r.score,0)},
-  ];
-  const focoF = () => card('Lista de foco', fl.length ? fl.length+' para operar' : null,
-    `<p class="nota" style="margin:0 0 6px">VCP, compresión o AVWAP con volumen · RS ${P.foco_rs}+ · riesgo ≤${fmt(P.foco_riesgo,0)}% · sin banderas ni earnings.${R && R.score<40 ? ' <b>Régimen defensivo: tamaño chico o esperar.</b>' : ''}</p>`
-    + filasLista(fl.map(r=>({a:idx[r.t], extra:ambas(r.t), setup:esc(r.setup), e:r.entrada, st:r.stop, r:r.riesgo, d:r.dist})), 'Ningún setup cumple todo hoy. Mejor esperar que forzar.'));
   const spot = top.length ? `<div class="grid g3">${top.map(a=>`<div class="card spot" data-t="${esc(a.t)}" tabindex="0">
       <div class="cab">${ring(a.score)}<div><h4>${esc(a.t)}</h4><p>${esc(a.sector)}${a.estadio?' · estadio '+a.estadio:''}</p><p>${flags(a,3)}</p></div></div>
       <div class="partes">${pilares(a).map(([n,k,m,c])=>`<span class="mut">${n}</span><span class="pbar"><i style="width:${(a.partes[k]||0)/m*100}%;background:${c}"></i></span><span>${fmt(a.partes[k]||0,0)}</span>`).join('')}</div></div>`).join('')}</div>`
@@ -2761,36 +2789,11 @@ function bloques(){
       ], H.filas.slice(0, S.trackMas ? H.filas.length : 10).map(f=>({f, a: idx2[f.t] || {t:f.t}})), 'Todavía no hay ingresos registrados: se van sumando desde hoy.')
     + (H.filas.length > 10 ? `<button class="chip" data-trackmas="1" style="margin-top:10px">${S.trackMas ? 'Ver menos' : 'Ver los '+(H.filas.length-10)+' restantes'}</button>` : '')
     + (H.ruedas < 5 ? `<p class="nota" style="margin:10px 0 0">El registro arrancó hace ${H.ruedas} ${H.ruedas===1?'rueda':'ruedas'}; se vuelve útil con algunas semanas de historia.</p>` : ''))}</div>` : '';
-  // Crème: Seleccionadas con un gatillo concreto cerca (mismo criterio que "armadas" del resumen de Telegram)
-  const CERCA = P.resumen_cerca || 2;
-  const gatillo = a => {
-    const v = a.vcp, s = a.setup_av && a.setup_av.d, c = a.comp && a.comp.d, i = a.inside && a.inside.d;
-    if(v && v.estado==='recien') return {m:'VCP recién rota', e:v.pivot, st:v.stop, d:v.dist};
-    if(v && (v.estado==='armada' || (v.dist!=null && v.dist>=-CERCA && v.dist<=0))) return {m:'VCP '+v.estado, e:v.pivot, st:v.stop, d:v.dist};
-    if(s && s.estado==='rompe') return {m:'Ruptura AVWAP '+s.ancla.toLowerCase(), e:s.entrada, st:s.stop, d:(a.precio/s.entrada-1)*100};
-    if(s && s.estado==='por romper' && (s.entrada/a.precio-1)*100 <= CERCA) return {m:'AVWAP '+s.ancla.toLowerCase()+' por romper', e:s.entrada, st:s.stop, d:(a.precio/s.entrada-1)*100};
-    if(c && c.ruptura) return {m:'Ruptura de compresión', e:c.gatillo, st:c.piso, d:c.dist_gatillo!=null?-c.dist_gatillo:null};
-    if(c && c.es && c.dist_gatillo!=null && c.dist_gatillo <= CERCA) return {m:'Compresión cerca del gatillo', e:c.gatillo, st:c.piso, d:-c.dist_gatillo};
-    if(i && i.n>=1 && i.dist_hi!=null && i.dist_hi <= CERCA) return {m:(i.n>1?i.n+' ':'')+'inside day', e:i.madre_hi, st:i.madre_lo, d:-i.dist_hi};
-    if(a.tc && a.tc.cerca) return {m:a.tc.n+' cierres apretados (TC)', e:null, st:null, d:a.tc.dist};
-    return null;
-  };
-  const crema = sel.map(a=>({a, g:gatillo(a)})).filter(x=>x.g && (x.g.d==null || x.g.d <= (P.zona_compra||5)));
-  const cCr = [
-    {h:'', f:r=>`<span class="rk">${r.i+1}</span>`},
-    {h:'Ticker', f:r=>tk(r.a)+ambas(r.a.t)},
-    {h:'Gatillo', f:r=>`<b>${esc(r.g.m)}</b>`},
-    {h:'Entrada', n:1, f:r=>pr(r.g.e)},
-    {h:'Stop', n:1, f:r=>pr(r.g.st)},
-    {h:'Riesgo', n:1, f:r=>r.g.e&&r.g.st&&r.g.e>r.g.st ? fmt((r.g.e-r.g.st)/r.g.e*100,1)+'%' : '–'},
-    {h:'Precio vs. gatillo', n:1, f:r=>r.g.d!=null ? `<span class="${cls(r.g.d)}">${pct(r.g.d)}</span>` : '–'},
-    {h:'Score', n:1, f:r=>`<span class="scp">${fmt(r.a.score,0)}</span>`},
-  ];
-  AMBAS = new Set(crema.map(x=>x.a.t).filter(t=>fl.some(f=>f.t===t)));
-  const cremaF = () => card('Crème de la crème', crema.length ? crema.length+' con gatillo cerca' : null,
-    `<p class="nota" style="margin:0 0 6px">Seleccionadas (RS ${(P.sel||{}).rs||80}+, ${(P.sel||{}).mv||7}/8+, score ${(P.sel||{}).score||70}+) con un gatillo cerca o recién roto. vs. entrada negativo = falta; positivo = ya rompió.</p>`
-    + filasLista(crema.map(x=>({a:x.a, extra:ambas(x.a.t), setup:esc(x.g.m), e:x.g.e, st:x.g.st, r:x.g.e&&x.g.st&&x.g.e>x.g.st?(x.g.e-x.g.st)/x.g.e*100:null, d:x.g.d})), 'Ninguna Seleccionada tiene un gatillo cerca hoy.'));
-  const dosH = `<div class="grid g2 dos foco">${focoF()}${cremaF()}</div>${AMBAS.size ? `<p class="nota" style="margin:-8px 0 16px">⭐ ambas = está en las dos listas: ${[...AMBAS].map(esc).join(', ')}.</p>` : ''}`;
+  // Crème de la crème: una sola lista (Seleccionadas + setup de estructura + filtros de calidad), armada en Python
+  const SLc = P.sel || {rs:80, mv:7, score:70};
+  const dosH = `<div class="foco">${card('Crème de la crème', fl.length ? fl.length+' para operar' : null,
+    `<p class="nota" style="margin:0 0 6px">Seleccionadas (RS ${SLc.rs}+, ${SLc.mv}/8+, score ${SLc.score}+) con VCP, compresión, inside day o cierres apretados cerca o recién rotos · riesgo ≤${fmt(P.foco_riesgo,0)}% · hasta ${fmt(P.zona_compra||5,0)}% sobre la entrada · sin banderas ni earnings. vs. entrada negativo = falta; positivo = ya rompió.${R && R.score<40 ? ' <b>Régimen defensivo: tamaño chico o esperar.</b>' : ''}</p>`
+    + filasLista(fl.map(r=>({a:idx[r.t], setup:esc(r.setup), e:r.entrada, st:r.stop, r:r.riesgo, d:r.dist})), 'Ninguna Seleccionada tiene un setup limpio cerca hoy. Mejor esperar que forzar.'))}</div>`;
   return {reg, dosH, selH, trackH, topH, topOpt, nuevos, cart, emb: emb ? `<div class="foco">${emb}</div>` : ''};
 }
 
@@ -3170,6 +3173,8 @@ function ficha(t){
     <h4>Score</h4>
     <div style="display:flex;gap:18px;align-items:center">${ring(a.score, 84)}
       <div class="partes" style="flex:1">${PT.map(([n,k,m,c])=>`<span class="mut">${n}</span><span class="pbar"><i style="width:${(a.partes[k]||0)/m*100}%;background:${c}"></i></span><span>${fmt(a.partes[k]||0,1)}/${m}</span>`).join('')}</div></div>
+    ${a.estructura ? `<p class="nota" style="margin-top:8px">Estructura: ${[a.estructura.pivot ? `a ${pct(a.estructura.pivot[2],1)} del pivot ${pr(a.estructura.pivot[0])} (${esc(a.estructura.pivot[1])}) +${fmt(a.estructura.pivot[3],1)}` : 'sin base de 3 semanas o más',
+      a.estructura.vcp ? 'VCP +'+a.estructura.vcp : '', a.estructura.tc ? 'cierres apretados +'+a.estructura.tc : '', a.estructura.seco ? 'volumen seco +2' : '', a.estructura.emas ? 'EMAs 10/20/50 subiendo +2' : ''].filter(Boolean).join(' · ')}. Los gatillos (AVWAP, 30 min, inside) no suman al score.</p>` : ''}
     ${a.castigo>0 ? `<p class="nota" style="margin-top:8px">Descuento de ${fmt(a.castigo,0)} puntos por banderas (estirada, extendido, sin volumen o rechazo).</p>` : ''}
     <h4>Gates Stage 2</h4>
     <div class="gate"><span><b class="${a.mv_checks[0]&&(a.pend||[])[4]>0?'up':'down'}">${a.mv_checks[0]&&(a.pend||[])[4]>0?'✓':'✗'}</b> Precio sobre la EMA200 con pendiente positiva</span><span class="${cls(a.d200)}">${pct(a.d200,1)}</span></div>
@@ -3240,7 +3245,7 @@ function buscarHTML(){
     const st = filasGatillos('d').filter(r => r.a.t===q);
     const SL = P.sel || {rs:80, mv:7, score:70};
     const listas = [esSelA(a) ? 'Seleccionadas' : null, (a.rs>=SL.rs && a.mv>=SL.mv) ? 'Líderes' : null,
-      (D.foco||[]).some(f=>f.t===q) ? 'Lista de foco' : null].filter(Boolean);
+      (D.foco||[]).some(f=>f.t===q) ? 'Crème de la crème' : null].filter(Boolean);
     return `<div class="card busq" data-t="${esc(a.t)}" tabindex="0">
       <div class="bq1"><span class="gt">${esc(a.t)}</span><span class="mut">${esc(a.nombre)}</span><span class="ver">Abrir ficha →</span></div>
       <div class="bq2"><span>En el radar · <b>#${D.activos.indexOf(a)+1}</b> de ${D.activos.length} por score</span><span>Score <b>${fmt(a.score,0)}</b></span><span>${xo8(a)}</span><span>RS <b>${fmt(a.rs,0)}</b></span><span>ADR ${adrC(a.adr)}</span></div>
